@@ -23,10 +23,11 @@ const (
 	MaxHeadersPerTx = 12
 
 	// ABI offsets into the modified ProofOutputs struct (all fields are 32 bytes)
-	// executionBlockHash is at field index 6 (after prevHeader, prevHead,
-	// prevSyncCommitteeHash, newHead, newHeader, executionStateRoot)
-	OffsetBlockHash   = 192 // 6 * 32
-	OffsetBlockNumber = 224 // 7 * 32
+	// Field order: prevHeader, prevHead, prevSyncCommitteeHash, newHead, newHeader,
+	// executionStateRoot, executionBlockHash, executionBlockNumber
+	OffsetStateRoot    = 160 // 5 * 32
+	OffsetBlockHash    = 192 // 6 * 32
+	OffsetBlockNumber  = 224 // 7 * 32
 	MinPublicValuesLen = 256 // need at least 8 fields
 )
 
@@ -90,14 +91,10 @@ type SubmitProofParams struct {
 	Headers      []SubmittedHeader `json:"headers"`
 }
 
+// SubmittedHeader carries only the canonical RLP. All header fields are
+// extracted from the RLP itself; JSON copies are not trusted.
 type SubmittedHeader struct {
-	RlpHex           string `json:"rlp_hex"`
-	BlockNumber      uint64 `json:"block_number"`
-	TransactionsRoot string `json:"transactions_root"`
-	ReceiptsRoot     string `json:"receipts_root"`
-	BaseFeePerGas    uint64 `json:"base_fee_per_gas"`
-	GasLimit         uint64 `json:"gas_limit"`
-	Timestamp        uint64 `json:"timestamp"`
+	RlpHex string `json:"rlp_hex"`
 }
 
 //go:wasmexport submitProof
@@ -142,112 +139,221 @@ func submitProof() {
 	if err != nil || len(pvBytes) < MinPublicValuesLen {
 		sdk.Revert("public_values too short or invalid hex", "submitProof")
 	}
+	provenStateRoot := hex.EncodeToString(pvBytes[OffsetStateRoot : OffsetStateRoot+32])
 	provenBlockHash := hex.EncodeToString(pvBytes[OffsetBlockHash : OffsetBlockHash+32])
 	provenBlockNumber := readUint64BE(pvBytes[OffsetBlockNumber+24:]) // last 8 bytes of uint256
 
-	// 3. Verify hash chain: last header must match proven block hash
+	// 3. Parse every header from its RLP and compute keccak hashes.
+	// Trust flows: proof -> provenBlockHash -> last RLP keccak -> earlier RLPs
+	// via parentHash chain -> all extracted fields from each RLP.
 	lastIdx := len(params.Headers) - 1
-	lastHeader := params.Headers[lastIdx]
+	parsed := make([]parsedHeader, len(params.Headers))
+	hashes := make([]string, len(params.Headers))
+	for i, h := range params.Headers {
+		parsed[i] = parseHeader(h.RlpHex)
+		hashes[i] = sdk.Keccak256(h.RlpHex)
+	}
 
-	if lastHeader.BlockNumber != provenBlockNumber {
+	// 4. Bind the last header's RLP and extracted fields to the proof's public inputs.
+	if hashes[lastIdx] != provenBlockHash {
+		sdk.Revert("keccak256(last header RLP) != proven block hash", "submitProof")
+	}
+	if parsed[lastIdx].BlockNumber != provenBlockNumber {
 		sdk.Revert("last header block number ("+
-			strconv.FormatUint(lastHeader.BlockNumber, 10)+
+			strconv.FormatUint(parsed[lastIdx].BlockNumber, 10)+
 			") != proven block number ("+
 			strconv.FormatUint(provenBlockNumber, 10)+")", "submitProof")
 	}
-
-	lastHeaderHash := sdk.Keccak256(lastHeader.RlpHex)
-	if lastHeaderHash != provenBlockHash {
-		sdk.Revert("keccak256(last header RLP) != proven block hash", "submitProof")
+	if hex.EncodeToString(parsed[lastIdx].StateRoot[:]) != provenStateRoot {
+		sdk.Revert("last header state_root != proven state root", "submitProof")
 	}
 
-	// 4. Verify hash chain backwards: each header's parentHash == hash of previous
-	headerHashes := make([]string, len(params.Headers))
-	headerHashes[lastIdx] = lastHeaderHash
-
+	// 5. Walk the keccak chain backward. parentHash comes from the parsed RLP,
+	// so if this passes, every earlier header's RLP is bound to a real ancestor.
 	for i := lastIdx - 1; i >= 0; i-- {
-		headerHashes[i] = sdk.Keccak256(params.Headers[i].RlpHex)
-
-		// parentHash is the first 32 bytes of the RLP-decoded header.
-		// In RLP encoding: list prefix (variable 1-3 bytes) + parentHash (32 bytes).
-		// We extract parentHash from the NEXT header's RLP to verify the chain.
-		nextParentHash := extractParentHash(params.Headers[i+1].RlpHex)
-		if nextParentHash != headerHashes[i] {
+		expectedParent := hex.EncodeToString(parsed[i+1].ParentHash[:])
+		if expectedParent != hashes[i] {
 			sdk.Revert("hash chain broken at block "+
-				strconv.FormatUint(params.Headers[i].BlockNumber, 10), "submitProof")
+				strconv.FormatUint(parsed[i].BlockNumber, 10), "submitProof")
 		}
 	}
 
-	// 5. Check sequential and store
+	// 6. Sequential block-number check + store the RLP-extracted fields.
 	lastHeight := getLastHeight()
-	for i, header := range params.Headers {
-		if lastHeight > 0 && header.BlockNumber != lastHeight+1 {
+	maxRetention := getMaxRetention()
+	for i := range parsed {
+		p := parsed[i]
+		if lastHeight > 0 && p.BlockNumber != lastHeight+1 {
 			sdk.Revert("block heights must be sequential", "submitProof")
 		}
-		if i > 0 && header.BlockNumber != params.Headers[i-1].BlockNumber+1 {
+		if i > 0 && p.BlockNumber != parsed[i-1].BlockNumber+1 {
 			sdk.Revert("headers not sequential within batch", "submitProof")
 		}
 
-		txRoot, err := hexTo32(header.TransactionsRoot)
-		if err != nil {
-			sdk.Revert("invalid transactions_root", "submitProof")
-		}
-		rcptRoot, err := hexTo32(header.ReceiptsRoot)
-		if err != nil {
-			sdk.Revert("invalid receipts_root", "submitProof")
-		}
+		storeHeader(p.BlockNumber, p.StateRoot, p.TxRoot, p.RcptRoot, p.BaseFeePerGas, p.GasLimit, p.Timestamp)
+		lastHeight = p.BlockNumber
 
-		storeHeader(header.BlockNumber, txRoot, rcptRoot, header.BaseFeePerGas, header.GasLimit, header.Timestamp)
-		lastHeight = header.BlockNumber
-
-		maxRetention := getMaxRetention()
-		if header.BlockNumber > maxRetention {
-			sdk.StateDeleteObject(KeyBlockPrefix + strconv.FormatUint(header.BlockNumber-maxRetention, 10))
+		if p.BlockNumber > maxRetention {
+			sdk.StateDeleteObject(KeyBlockPrefix + strconv.FormatUint(p.BlockNumber-maxRetention, 10))
 		}
 	}
 
 	sdk.StateSetObject(KeyLastHeight, strconv.FormatUint(lastHeight, 10))
 }
 
-// extractParentHash reads the parentHash from an RLP-encoded block header.
-// The RLP structure is: rlp_list_prefix + parentHash(32 bytes) + ...
-// For post-merge Ethereum headers, the list prefix is 3 bytes (0xf9 + 2-byte length).
-// parentHash is always the first element, starting at byte 3.
-func extractParentHash(rlpHex string) string {
-	// Decode enough bytes to get the list prefix + parentHash
-	if len(rlpHex) < 70 { // 3 bytes prefix + 32 bytes parentHash = 35 bytes = 70 hex chars
-		return ""
-	}
-	rlpBytes, err := hex.DecodeString(rlpHex[:70])
+// --- RLP decoder ---
+//
+// Header field order (post-merge Ethereum, per yellow paper / EIP-1559):
+//   0  parentHash         9  gasLimit
+//   1  ommersHash         10 gasUsed
+//   2  coinbase           11 timestamp
+//   3  stateRoot          12 extraData
+//   4  transactionsRoot   13 mixHash
+//   5  receiptsRoot       14 nonce
+//   6  logsBloom          15 baseFeePerGas
+//   7  difficulty         (16+ withdrawalsRoot/blob fields ignored)
+//   8  number
+
+type parsedHeader struct {
+	BlockNumber   uint64
+	ParentHash    [32]byte
+	StateRoot     [32]byte
+	TxRoot        [32]byte
+	RcptRoot      [32]byte
+	GasLimit      uint64
+	Timestamp     uint64
+	BaseFeePerGas uint64
+}
+
+func parseHeader(rlpHex string) parsedHeader {
+	rlpBytes, err := hex.DecodeString(rlpHex)
 	if err != nil {
-		return ""
+		sdk.Revert("invalid rlp_hex", "submitProof")
 	}
+	payloadStart, _, _, isList := readRLPItem(rlpBytes, 0)
+	if !isList {
+		sdk.Revert("rlp not a list", "submitProof")
+	}
+	p := payloadStart
+	var h parsedHeader
 
-	// Determine RLP list prefix length
-	firstByte := rlpBytes[0]
-	var dataStart int
-	if firstByte >= 0xf8 {
-		// Long list: 1 byte type + N bytes length
-		lenBytes := int(firstByte - 0xf7)
-		dataStart = 1 + lenBytes
-	} else if firstByte >= 0xc0 {
-		// Short list: 1 byte
-		dataStart = 1
-	} else {
-		return ""
-	}
+	p = readBytes32(rlpBytes, p, &h.ParentHash)
+	p = skipItem(rlpBytes, p) // ommersHash
+	p = skipItem(rlpBytes, p) // coinbase
+	p = readBytes32(rlpBytes, p, &h.StateRoot)
+	p = readBytes32(rlpBytes, p, &h.TxRoot)
+	p = readBytes32(rlpBytes, p, &h.RcptRoot)
+	p = skipItem(rlpBytes, p) // logsBloom
+	p = skipItem(rlpBytes, p) // difficulty
+	p, h.BlockNumber = readUintField(rlpBytes, p)
+	p, h.GasLimit = readUintField(rlpBytes, p)
+	p = skipItem(rlpBytes, p) // gasUsed
+	p, h.Timestamp = readUintField(rlpBytes, p)
+	p = skipItem(rlpBytes, p) // extraData
+	p = skipItem(rlpBytes, p) // mixHash
+	p = skipItem(rlpBytes, p) // nonce
+	_, h.BaseFeePerGas = readUintField(rlpBytes, p)
 
-	if len(rlpBytes) < dataStart+32 {
-		return ""
+	return h
+}
+
+// readRLPItem returns (valueStart, valueLen, nextOffset, isList) for the RLP
+// item beginning at buf[offset]. Reverts on truncated/malformed input.
+func readRLPItem(buf []byte, offset int) (int, int, int, bool) {
+	if offset >= len(buf) {
+		sdk.Revert("rlp truncated", "submitProof")
 	}
-	return hex.EncodeToString(rlpBytes[dataStart : dataStart+32])
+	b := buf[offset]
+	switch {
+	case b < 0x80:
+		// single byte 0x00..0x7f is its own encoding
+		return offset, 1, offset + 1, false
+	case b < 0xb8:
+		l := int(b - 0x80)
+		if offset+1+l > len(buf) {
+			sdk.Revert("rlp string truncated", "submitProof")
+		}
+		return offset + 1, l, offset + 1 + l, false
+	case b < 0xc0:
+		ll := int(b - 0xb7)
+		if offset+1+ll > len(buf) {
+			sdk.Revert("rlp long-string len truncated", "submitProof")
+		}
+		l := readRLPLen(buf[offset+1 : offset+1+ll])
+		end := offset + 1 + ll + l
+		if end > len(buf) {
+			sdk.Revert("rlp long-string truncated", "submitProof")
+		}
+		return offset + 1 + ll, l, end, false
+	case b < 0xf8:
+		l := int(b - 0xc0)
+		if offset+1+l > len(buf) {
+			sdk.Revert("rlp short-list truncated", "submitProof")
+		}
+		return offset + 1, l, offset + 1 + l, true
+	default:
+		ll := int(b - 0xf7)
+		if offset+1+ll > len(buf) {
+			sdk.Revert("rlp long-list len truncated", "submitProof")
+		}
+		l := readRLPLen(buf[offset+1 : offset+1+ll])
+		end := offset + 1 + ll + l
+		if end > len(buf) {
+			sdk.Revert("rlp long-list truncated", "submitProof")
+		}
+		return offset + 1 + ll, l, end, true
+	}
+}
+
+func readRLPLen(buf []byte) int {
+	if len(buf) > 8 {
+		sdk.Revert("rlp len overflow", "submitProof")
+	}
+	var v int
+	for _, b := range buf {
+		v = (v << 8) | int(b)
+	}
+	return v
+}
+
+func readBytes32(buf []byte, offset int, out *[32]byte) int {
+	s, l, next, isList := readRLPItem(buf, offset)
+	if isList {
+		sdk.Revert("rlp expected string, got list", "submitProof")
+	}
+	if l != 32 {
+		sdk.Revert("rlp expected 32-byte field", "submitProof")
+	}
+	copy(out[:], buf[s:s+32])
+	return next
+}
+
+func skipItem(buf []byte, offset int) int {
+	_, _, next, _ := readRLPItem(buf, offset)
+	return next
+}
+
+func readUintField(buf []byte, offset int) (int, uint64) {
+	s, l, next, isList := readRLPItem(buf, offset)
+	if isList {
+		sdk.Revert("rlp expected uint, got list", "submitProof")
+	}
+	if l > 8 {
+		sdk.Revert("rlp uint > 8 bytes", "submitProof")
+	}
+	var v uint64
+	for i := 0; i < l; i++ {
+		v = (v << 8) | uint64(buf[s+i])
+	}
+	return next, v
 }
 
 // --- Storage helpers ---
 
-func storeHeader(blockNumber uint64, txRoot, rcptRoot [32]byte, baseFee, gasLimit, timestamp uint64) {
-	buf := make([]byte, 0, 96)
+func storeHeader(blockNumber uint64, stateRoot, txRoot, rcptRoot [32]byte, baseFee, gasLimit, timestamp uint64) {
+	buf := make([]byte, 0, 128)
 	buf = appendUint64(buf, blockNumber)
+	buf = append(buf, stateRoot[:]...)
 	buf = append(buf, txRoot[:]...)
 	buf = append(buf, rcptRoot[:]...)
 	buf = appendUint64(buf, baseFee)
@@ -280,16 +386,6 @@ func checkOwner() {
 	if owner == nil || caller != *owner {
 		sdk.Revert("owner required", "auth")
 	}
-}
-
-func hexTo32(s string) ([32]byte, error) {
-	var result [32]byte
-	b, err := hex.DecodeString(s)
-	if err != nil || len(b) != 32 {
-		return result, err
-	}
-	copy(result[:], b)
-	return result, nil
 }
 
 func appendUint64(buf []byte, v uint64) []byte {

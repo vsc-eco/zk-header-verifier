@@ -24,7 +24,7 @@ WASM contract for Magi that verifies SP1 Groth16 proofs of Ethereum consensus an
 | Key | Value | Compatible with |
 |-----|-------|-----------------|
 | `h` | Last verified block height | evm-mapping-contract `GetLastHeight()` |
-| `b-{N}` | 96-byte binary block header | evm-mapping-contract `GetHeader(N)` |
+| `b-{N}` | 128-byte binary block header | evm-mapping-contract `GetHeader(N)` |
 | `vk` | Groth16 VK hex | — |
 | `vr` | VK root hex | — |
 | `sp1vk` | SP1 program vkey hash hex | — |
