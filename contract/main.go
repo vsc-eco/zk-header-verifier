@@ -34,18 +34,14 @@ const (
 // --- Admin actions ---
 
 //go:wasmexport init
-func initContract() {
+func initContract(input *string) *string {
 	checkOwner()
-	payload := sdk.GetEnvKey("msg.payload")
-	if payload == nil {
-		sdk.Revert("no payload", "init")
-	}
 	var params struct {
 		Groth16Vk   string `json:"groth16_vk"`
 		VkRoot      string `json:"vk_root"`
 		Sp1VkeyHash string `json:"sp1_vkey_hash"`
 	}
-	if err := json.Unmarshal([]byte(*payload), &params); err != nil {
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
 		sdk.Revert("invalid JSON", "init")
 	}
 	if params.Groth16Vk == "" || params.VkRoot == "" || params.Sp1VkeyHash == "" {
@@ -55,21 +51,18 @@ func initContract() {
 	sdk.StateSetObject(KeyVkRoot, params.VkRoot)
 	sdk.StateSetObject(KeySp1VkeyHash, params.Sp1VkeyHash)
 	sdk.StateSetObject(KeyMaxRetention, strconv.FormatUint(DefaultMaxRetention, 10))
+	return nil
 }
 
 //go:wasmexport updateVkey
-func updateVkey() {
+func updateVkey(input *string) *string {
 	checkOwner()
-	payload := sdk.GetEnvKey("msg.payload")
-	if payload == nil {
-		sdk.Revert("no payload", "updateVkey")
-	}
 	var params struct {
 		Groth16Vk   string `json:"groth16_vk"`
 		VkRoot      string `json:"vk_root"`
 		Sp1VkeyHash string `json:"sp1_vkey_hash"`
 	}
-	if err := json.Unmarshal([]byte(*payload), &params); err != nil {
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
 		sdk.Revert("invalid JSON", "updateVkey")
 	}
 	if params.Groth16Vk != "" {
@@ -81,6 +74,7 @@ func updateVkey() {
 	if params.Sp1VkeyHash != "" {
 		sdk.StateSetObject(KeySp1VkeyHash, params.Sp1VkeyHash)
 	}
+	return nil
 }
 
 // --- Permissionless proof submission ---
@@ -98,13 +92,9 @@ type SubmittedHeader struct {
 }
 
 //go:wasmexport submitProof
-func submitProof() {
-	payload := sdk.GetEnvKey("msg.payload")
-	if payload == nil {
-		sdk.Revert("no payload", "submitProof")
-	}
+func submitProof(input *string) *string {
 	var params SubmitProofParams
-	if err := json.Unmarshal([]byte(*payload), &params); err != nil {
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
 		sdk.Revert("invalid JSON: "+err.Error(), "submitProof")
 	}
 	if params.Proof == "" || params.PublicValues == "" || len(params.Headers) == 0 {
@@ -199,6 +189,7 @@ func submitProof() {
 	}
 
 	sdk.StateSetObject(KeyLastHeight, strconv.FormatUint(lastHeight, 10))
+	return nil
 }
 
 // --- RLP decoder ---
