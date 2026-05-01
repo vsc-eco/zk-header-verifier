@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/hex"
 	"testing"
+
+	ce "zk-header-verifier/contract/contracterrors"
 )
 
 // Real SP1-Helios v6.1.0 ABI-encoded ProofOutputs for Sepolia block 10764834.
@@ -27,9 +29,9 @@ func mustDecodeHex(t *testing.T, s string) []byte {
 func TestParseProvenFields_HappyPath(t *testing.T) {
 	pv := mustDecodeHex(t, v6_1_0_PublicValuesHex)
 
-	stateRoot, blockHash, blockNumber, errMsg := parseProvenFields(pv)
-	if errMsg != "" {
-		t.Fatalf("unexpected error: %q", errMsg)
+	stateRoot, blockHash, blockNumber, err := parseProvenFields(pv)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if stateRoot != expectedStateRoot {
 		t.Errorf("stateRoot = %q, want %q", stateRoot, expectedStateRoot)
@@ -53,9 +55,12 @@ func TestParseProvenFields_TooShort(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, _, errMsg := parseProvenFields(make([]byte, tt.size))
-			if errMsg == "" {
+			_, _, _, err := parseProvenFields(make([]byte, tt.size))
+			if err == nil {
 				t.Fatal("expected error for short input, got none")
+			}
+			if err.Symbol != ce.ErrInput {
+				t.Errorf("symbol = %q, want ErrInput", err.Symbol)
 			}
 		})
 	}
@@ -68,9 +73,12 @@ func TestParseProvenFields_WrongAbiOffset(t *testing.T) {
 	// so the length check passes; only the offset check should reject this.
 	pv[31] = 0x40
 
-	_, _, _, errMsg := parseProvenFields(pv)
-	if errMsg == "" {
+	_, _, _, err := parseProvenFields(pv)
+	if err == nil {
 		t.Fatal("expected error for non-32 ABI offset, got none")
+	}
+	if err.Symbol != ce.ErrInput {
+		t.Errorf("symbol = %q, want ErrInput", err.Symbol)
 	}
 }
 
@@ -83,9 +91,9 @@ func TestParseProvenFields_OffsetExactlyAtBoundary(t *testing.T) {
 	// Plant a recognizable block number at the right offset
 	pv[PvFieldBlockNumber+31] = 0x42
 
-	_, _, blockNumber, errMsg := parseProvenFields(pv)
-	if errMsg != "" {
-		t.Fatalf("unexpected error at PvMinLen boundary: %q", errMsg)
+	_, _, blockNumber, err := parseProvenFields(pv)
+	if err != nil {
+		t.Fatalf("unexpected error at PvMinLen boundary: %v", err)
 	}
 	if blockNumber != 0x42 {
 		t.Errorf("blockNumber = %d, want 0x42", blockNumber)

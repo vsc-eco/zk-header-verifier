@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"strconv"
+	ce "zk-header-verifier/contract/contracterrors"
 	"zk-header-verifier/sdk"
 )
 
@@ -45,10 +46,10 @@ func initContract(input *string) *string {
 		Sp1VkeyHash string `json:"sp1_vkey_hash"`
 	}
 	if err := json.Unmarshal([]byte(*input), &params); err != nil {
-		sdk.Revert("invalid JSON", "init")
+		ce.Abort(ce.ErrJson, "invalid JSON", "init")
 	}
 	if params.Groth16Vk == "" || params.VkRoot == "" || params.Sp1VkeyHash == "" {
-		sdk.Revert("groth16_vk, vk_root, and sp1_vkey_hash required", "init")
+		ce.Abort(ce.ErrInput, "groth16_vk, vk_root, and sp1_vkey_hash required", "init")
 	}
 	sdk.StateSetObject(KeyGroth16Vk, params.Groth16Vk)
 	sdk.StateSetObject(KeyVkRoot, params.VkRoot)
@@ -66,7 +67,7 @@ func updateVkey(input *string) *string {
 		Sp1VkeyHash string `json:"sp1_vkey_hash"`
 	}
 	if err := json.Unmarshal([]byte(*input), &params); err != nil {
-		sdk.Revert("invalid JSON", "updateVkey")
+		ce.Abort(ce.ErrJson, "invalid JSON", "updateVkey")
 	}
 	if params.Groth16Vk != "" {
 		sdk.StateSetObject(KeyGroth16Vk, params.Groth16Vk)
@@ -98,43 +99,43 @@ type SubmittedHeader struct {
 func submitProof(input *string) *string {
 	var params SubmitProofParams
 	if err := json.Unmarshal([]byte(*input), &params); err != nil {
-		sdk.Revert("invalid JSON: "+err.Error(), "submitProof")
+		ce.Abort(ce.ErrJson, "invalid JSON: "+err.Error(), "submitProof")
 	}
 	if params.Proof == "" || params.PublicValues == "" || len(params.Headers) == 0 {
-		sdk.Revert("proof, public_values, and headers required", "submitProof")
+		ce.Abort(ce.ErrInput, "proof, public_values, and headers required", "submitProof")
 	}
 	if len(params.Headers) > MaxHeadersPerTx {
-		sdk.Revert("too many headers (max "+strconv.Itoa(MaxHeadersPerTx)+")", "submitProof")
+		ce.Abort(ce.ErrInput, "too many headers (max "+strconv.Itoa(MaxHeadersPerTx)+")", "submitProof")
 	}
 
 	// Load verification parameters
 	groth16Vk := sdk.StateGetObject(KeyGroth16Vk)
 	if groth16Vk == nil || *groth16Vk == "" {
-		sdk.Revert("not initialized: no groth16_vk", "submitProof")
+		ce.Abort(ce.ErrInitialization, "not initialized: no groth16_vk", "submitProof")
 	}
 	vkRoot := sdk.StateGetObject(KeyVkRoot)
 	if vkRoot == nil || *vkRoot == "" {
-		sdk.Revert("not initialized: no vk_root", "submitProof")
+		ce.Abort(ce.ErrInitialization, "not initialized: no vk_root", "submitProof")
 	}
 	sp1VkeyHash := sdk.StateGetObject(KeySp1VkeyHash)
 	if sp1VkeyHash == nil || *sp1VkeyHash == "" {
-		sdk.Revert("not initialized: no sp1_vkey_hash", "submitProof")
+		ce.Abort(ce.ErrInitialization, "not initialized: no sp1_vkey_hash", "submitProof")
 	}
 
 	// 1. Verify the ZK proof
 	result := sdk.Sp1VerifyGroth16(params.Proof, params.PublicValues, *sp1VkeyHash, *groth16Vk, *vkRoot)
 	if result != "true" {
-		sdk.Revert("proof verification failed", "submitProof")
+		ce.Abort(ce.ErrTransaction, "proof verification failed", "submitProof")
 	}
 
 	// 2. Decode publicValues to get proven block hash and number
 	pvBytes, err := hex.DecodeString(params.PublicValues)
 	if err != nil {
-		sdk.Revert("invalid public_values hex", "submitProof")
+		ce.Abort(ce.ErrInvalidHex, "invalid public_values hex", "submitProof")
 	}
 	provenStateRoot, provenBlockHash, provenBlockNumber, perr := parseProvenFields(pvBytes)
-	if perr != "" {
-		sdk.Revert(perr, "submitProof")
+	if perr != nil {
+		ce.CustomAbort(ce.Prepend(perr, "submitProof"))
 	}
 
 	// 3. Parse every header from its RLP and compute keccak hashes.
@@ -150,16 +151,16 @@ func submitProof(input *string) *string {
 
 	// 4. Bind the last header's RLP and extracted fields to the proof's public inputs.
 	if hashes[lastIdx] != provenBlockHash {
-		sdk.Revert("keccak256(last header RLP) != proven block hash", "submitProof")
+		ce.Abort(ce.ErrTransaction, "keccak256(last header RLP) != proven block hash", "submitProof")
 	}
 	if parsed[lastIdx].BlockNumber != provenBlockNumber {
-		sdk.Revert("last header block number ("+
+		ce.Abort(ce.ErrTransaction, "last header block number ("+
 			strconv.FormatUint(parsed[lastIdx].BlockNumber, 10)+
 			") != proven block number ("+
 			strconv.FormatUint(provenBlockNumber, 10)+")", "submitProof")
 	}
 	if hex.EncodeToString(parsed[lastIdx].StateRoot[:]) != provenStateRoot {
-		sdk.Revert("last header state_root != proven state root", "submitProof")
+		ce.Abort(ce.ErrTransaction, "last header state_root != proven state root", "submitProof")
 	}
 
 	// 5. Walk the keccak chain backward. parentHash comes from the parsed RLP,
@@ -167,7 +168,7 @@ func submitProof(input *string) *string {
 	for i := lastIdx - 1; i >= 0; i-- {
 		expectedParent := hex.EncodeToString(parsed[i+1].ParentHash[:])
 		if expectedParent != hashes[i] {
-			sdk.Revert("hash chain broken at block "+
+			ce.Abort(ce.ErrTransaction, "hash chain broken at block "+
 				strconv.FormatUint(parsed[i].BlockNumber, 10), "submitProof")
 		}
 	}
@@ -178,10 +179,10 @@ func submitProof(input *string) *string {
 	for i := range parsed {
 		p := parsed[i]
 		if lastHeight > 0 && p.BlockNumber != lastHeight+1 {
-			sdk.Revert("block heights must be sequential", "submitProof")
+			ce.Abort(ce.ErrInput, "block heights must be sequential", "submitProof")
 		}
 		if i > 0 && p.BlockNumber != parsed[i-1].BlockNumber+1 {
-			sdk.Revert("headers not sequential within batch", "submitProof")
+			ce.Abort(ce.ErrInput, "headers not sequential within batch", "submitProof")
 		}
 
 		storeHeader(p.BlockNumber, p.StateRoot, p.TxRoot, p.RcptRoot, p.BaseFeePerGas, p.GasLimit, p.Timestamp)
@@ -223,11 +224,11 @@ type parsedHeader struct {
 func parseHeader(rlpHex string) parsedHeader {
 	rlpBytes, err := hex.DecodeString(rlpHex)
 	if err != nil {
-		sdk.Revert("invalid rlp_hex", "submitProof")
+		ce.Abort(ce.ErrInvalidHex, "invalid rlp_hex", "submitProof")
 	}
 	payloadStart, _, _, isList := readRLPItem(rlpBytes, 0)
 	if !isList {
-		sdk.Revert("rlp not a list", "submitProof")
+		ce.Abort(ce.ErrInput, "rlp not a list", "submitProof")
 	}
 	p := payloadStart
 	var h parsedHeader
@@ -256,7 +257,7 @@ func parseHeader(rlpHex string) parsedHeader {
 // item beginning at buf[offset]. Reverts on truncated/malformed input.
 func readRLPItem(buf []byte, offset int) (int, int, int, bool) {
 	if offset >= len(buf) {
-		sdk.Revert("rlp truncated", "submitProof")
+		ce.Abort(ce.ErrInput, "rlp truncated", "submitProof")
 	}
 	b := buf[offset]
 	switch {
@@ -266,35 +267,35 @@ func readRLPItem(buf []byte, offset int) (int, int, int, bool) {
 	case b < 0xb8:
 		l := int(b - 0x80)
 		if offset+1+l > len(buf) {
-			sdk.Revert("rlp string truncated", "submitProof")
+			ce.Abort(ce.ErrInput, "rlp string truncated", "submitProof")
 		}
 		return offset + 1, l, offset + 1 + l, false
 	case b < 0xc0:
 		ll := int(b - 0xb7)
 		if offset+1+ll > len(buf) {
-			sdk.Revert("rlp long-string len truncated", "submitProof")
+			ce.Abort(ce.ErrInput, "rlp long-string len truncated", "submitProof")
 		}
 		l := readRLPLen(buf[offset+1 : offset+1+ll])
 		end := offset + 1 + ll + l
 		if end > len(buf) {
-			sdk.Revert("rlp long-string truncated", "submitProof")
+			ce.Abort(ce.ErrInput, "rlp long-string truncated", "submitProof")
 		}
 		return offset + 1 + ll, l, end, false
 	case b < 0xf8:
 		l := int(b - 0xc0)
 		if offset+1+l > len(buf) {
-			sdk.Revert("rlp short-list truncated", "submitProof")
+			ce.Abort(ce.ErrInput, "rlp short-list truncated", "submitProof")
 		}
 		return offset + 1, l, offset + 1 + l, true
 	default:
 		ll := int(b - 0xf7)
 		if offset+1+ll > len(buf) {
-			sdk.Revert("rlp long-list len truncated", "submitProof")
+			ce.Abort(ce.ErrInput, "rlp long-list len truncated", "submitProof")
 		}
 		l := readRLPLen(buf[offset+1 : offset+1+ll])
 		end := offset + 1 + ll + l
 		if end > len(buf) {
-			sdk.Revert("rlp long-list truncated", "submitProof")
+			ce.Abort(ce.ErrInput, "rlp long-list truncated", "submitProof")
 		}
 		return offset + 1 + ll, l, end, true
 	}
@@ -302,7 +303,7 @@ func readRLPItem(buf []byte, offset int) (int, int, int, bool) {
 
 func readRLPLen(buf []byte) int {
 	if len(buf) > 8 {
-		sdk.Revert("rlp len overflow", "submitProof")
+		ce.Abort(ce.ErrInput, "rlp len overflow", "submitProof")
 	}
 	var v int
 	for _, b := range buf {
@@ -314,10 +315,10 @@ func readRLPLen(buf []byte) int {
 func readBytes32(buf []byte, offset int, out *[32]byte) int {
 	s, l, next, isList := readRLPItem(buf, offset)
 	if isList {
-		sdk.Revert("rlp expected string, got list", "submitProof")
+		ce.Abort(ce.ErrInput, "rlp expected string, got list", "submitProof")
 	}
 	if l != 32 {
-		sdk.Revert("rlp expected 32-byte field", "submitProof")
+		ce.Abort(ce.ErrInput, "rlp expected 32-byte field", "submitProof")
 	}
 	copy(out[:], buf[s:s+32])
 	return next
@@ -331,10 +332,10 @@ func skipItem(buf []byte, offset int) int {
 func readUintField(buf []byte, offset int) (int, uint64) {
 	s, l, next, isList := readRLPItem(buf, offset)
 	if isList {
-		sdk.Revert("rlp expected uint, got list", "submitProof")
+		ce.Abort(ce.ErrInput, "rlp expected uint, got list", "submitProof")
 	}
 	if l > 8 {
-		sdk.Revert("rlp uint > 8 bytes", "submitProof")
+		ce.Abort(ce.ErrInput, "rlp uint > 8 bytes", "submitProof")
 	}
 	var v uint64
 	for i := 0; i < l; i++ {
@@ -379,7 +380,7 @@ func checkOwner() {
 	caller := sdk.GetEnv().Caller.String()
 	owner := sdk.GetEnvKey("contract.owner")
 	if owner == nil || caller != *owner {
-		sdk.Revert("owner required", "auth")
+		ce.Abort(ce.ErrNoPermission, "owner required", "auth")
 	}
 }
 
@@ -394,15 +395,16 @@ func readUint64BE(b []byte) uint64 {
 }
 
 // parseProvenFields extracts (executionStateRoot, executionBlockHash, executionBlockNumber)
-// from the SP1 program's ABI-encoded ProofOutputs bytes. Returns a non-empty errMsg on
-// any structural problem (too short, unexpected ABI offset). No SDK calls — pure function,
-// safe to test under standard go test.
-func parseProvenFields(pvBytes []byte) (stateRoot, blockHash string, blockNumber uint64, errMsg string) {
+// from the SP1 program's ABI-encoded ProofOutputs bytes. Returns a non-nil *ContractError
+// on any structural problem. No SDK calls — pure function, safe to test under standard
+// go test (contracterrors transitively imports sdk but its construction path doesn't
+// exercise any wasmimport).
+func parseProvenFields(pvBytes []byte) (stateRoot, blockHash string, blockNumber uint64, err *ce.ContractError) {
 	if len(pvBytes) < PvMinLen {
-		return "", "", 0, "public_values too short for ABI fields"
+		return "", "", 0, ce.NewContractError(ce.ErrInput, "public_values too short for ABI fields")
 	}
 	if readUint64BE(pvBytes[24:32]) != PvAbiOffset {
-		return "", "", 0, "unexpected ABI tuple offset (expected 32)"
+		return "", "", 0, ce.NewContractError(ce.ErrInput, "unexpected ABI tuple offset (expected 32)")
 	}
 	stateRoot = hex.EncodeToString(pvBytes[PvFieldStateRoot : PvFieldStateRoot+32])
 	blockHash = hex.EncodeToString(pvBytes[PvFieldBlockHash : PvFieldBlockHash+32])
