@@ -1,8 +1,2 @@
 bin/
-.env
-data/
-go.work
-go.work.sum
-.vscode
-*.wasm
-.DS_store
+.cache/

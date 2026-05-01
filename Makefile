@@ -19,10 +19,18 @@ GOWORK_EXTRA_MOUNTS := $(if $(wildcard go.work),$(shell \
     [ -d "$$host" ] && printf -- '-v %s:%s ' "$$host" "$$ctr"; \
   done),)
 
+CACHE_DIR := $(CURDIR)/.cache
+
+# tinygo 0.41+ writes a build cache via $HOME/.cache. With -u <uid>:<gid> and no
+# /etc/passwd entry inside the container, $HOME resolves to "/" and the mkdir
+# fails with permission denied. Mount a project-local cache dir and point HOME
+# at it so caches persist between builds (Go modules, tinygo build cache).
 TINYGO_CMD = docker run --rm \
     -u $(shell id -u):$(shell id -g) \
     $(GOWORK_EXTRA_MOUNTS) \
     -v $(CURDIR):$(WORKDIR) \
+    -v $(CACHE_DIR):/cache \
+    -e HOME=/cache \
     -w $(WORKDIR) \
     $(TINYGO_IMAGE) \
     tinygo
@@ -49,7 +57,7 @@ pull-tinygo:
 MODULE := $(shell head -1 go.mod | awk '{print $$2}')
 
 build:
-	@mkdir -p $(BIN_DIR); \
+	@mkdir -p $(BIN_DIR) $(CACHE_DIR); \
 	wasm_file="$(WASM)"; \
 	dir="$(ROOT_DIR)/$(dir $(TARGET))"; \
 	dir="$${dir%/}"; \
