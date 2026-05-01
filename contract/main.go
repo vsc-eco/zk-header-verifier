@@ -22,11 +22,21 @@ const (
 	// Each header with RLP hex costs ~681 CBOR bytes. 12 × 681 + 1000 overhead = ~9172 bytes.
 	MaxHeadersPerTx = 12
 
+<<<<<<< HEAD
 	// ProofOutputs ABI field indices (position within the struct)
 	FieldStateRoot   = 5
 	FieldBlockHash   = 6
 	FieldBlockNumber = 7
 	MinFieldCount    = 8
+=======
+	// ABI offsets into the modified ProofOutputs struct (all fields are 32 bytes)
+	// Field order: prevHeader, prevHead, prevSyncCommitteeHash, newHead, newHeader,
+	// executionStateRoot, executionBlockHash, executionBlockNumber
+	OffsetStateRoot    = 160 // 5 * 32
+	OffsetBlockHash    = 192 // 6 * 32
+	OffsetBlockNumber  = 224 // 7 * 32
+	MinPublicValuesLen = 256 // need at least 8 fields
+>>>>>>> 0073f22c79162bf8b9f267aa61b6609396c669cc
 )
 
 // --- Admin actions ---
@@ -127,6 +137,7 @@ func submitProof(input *string) *string {
 	if err != nil || len(pvBytes) < 32 {
 		sdk.Revert("public_values too short or invalid hex", "submitProof")
 	}
+<<<<<<< HEAD
 	base := readUint64BE(pvBytes[24:32])
 	minLen := base + uint64(MinFieldCount)*32
 	if minLen < base {
@@ -141,6 +152,12 @@ func submitProof(input *string) *string {
 	provenBlockHash := hex.EncodeToString(pvBytes[b+FieldBlockHash*32 : b+FieldBlockHash*32+32])
 	provenBlockNumber := readUint64BE(pvBytes[b+FieldBlockNumber*32+24 : b+FieldBlockNumber*32+32])
 
+=======
+	provenStateRoot := hex.EncodeToString(pvBytes[OffsetStateRoot : OffsetStateRoot+32])
+	provenBlockHash := hex.EncodeToString(pvBytes[OffsetBlockHash : OffsetBlockHash+32])
+	provenBlockNumber := readUint64BE(pvBytes[OffsetBlockNumber+24:]) // last 8 bytes of uint256
+
+>>>>>>> 0073f22c79162bf8b9f267aa61b6609396c669cc
 	// 3. Parse every header from its RLP and compute keccak hashes.
 	// Trust flows: proof -> provenBlockHash -> last RLP keccak -> earlier RLPs
 	// via parentHash chain -> all extracted fields from each RLP.
