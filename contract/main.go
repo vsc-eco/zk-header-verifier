@@ -22,11 +22,16 @@ const (
 	// Each header with RLP hex costs ~681 CBOR bytes. 12 × 681 + 1000 overhead = ~9172 bytes.
 	MaxHeadersPerTx = 12
 
-	// ProofOutputs ABI field indices (position within the struct)
-	FieldStateRoot   = 5
-	FieldBlockHash   = 6
-	FieldBlockNumber = 7
-	MinFieldCount    = 8
+	// ProofOutputs ABI layout (alloy::abi_encode of the SP1 program's output struct).
+	// alloy emits a 32-byte tuple head offset (always 0x20), then 8 head fields of
+	// 32 bytes each, then the dynamic tail. This contract reads fields 5/6/7 only.
+	// Offsets are computed from a fixed PvAbiOffset = 32; we assert the runtime
+	// value equals that constant before indexing, so int conversion is unnecessary.
+	PvAbiOffset        = 32                 // alloy tuple head, asserted equal at runtime
+	PvFieldStateRoot   = PvAbiOffset + 5*32 // 192
+	PvFieldBlockHash   = PvAbiOffset + 6*32 // 224
+	PvFieldBlockNumber = PvAbiOffset + 7*32 // 256
+	PvMinLen           = PvAbiOffset + 8*32 // 288 — 8 head fields fully present
 )
 
 // --- Admin actions ---
@@ -124,22 +129,13 @@ func submitProof(input *string) *string {
 
 	// 2. Decode publicValues to get proven block hash and number
 	pvBytes, err := hex.DecodeString(params.PublicValues)
-	if err != nil || len(pvBytes) < 32 {
-		sdk.Revert("public_values too short or invalid hex", "submitProof")
+	if err != nil {
+		sdk.Revert("invalid public_values hex", "submitProof")
 	}
-	base := readUint64BE(pvBytes[24:32])
-	minLen := base + uint64(MinFieldCount)*32
-	if minLen < base {
-		sdk.Revert("public_values offset overflow", "submitProof")
+	provenStateRoot, provenBlockHash, provenBlockNumber, perr := parseProvenFields(pvBytes)
+	if perr != "" {
+		sdk.Revert(perr, "submitProof")
 	}
-	if uint64(len(pvBytes)) < minLen {
-		sdk.Revert("public_values too short for ABI fields", "submitProof")
-	}
-
-	b := int(base)
-	provenStateRoot := hex.EncodeToString(pvBytes[b+FieldStateRoot*32 : b+FieldStateRoot*32+32])
-	provenBlockHash := hex.EncodeToString(pvBytes[b+FieldBlockHash*32 : b+FieldBlockHash*32+32])
-	provenBlockNumber := readUint64BE(pvBytes[b+FieldBlockNumber*32+24 : b+FieldBlockNumber*32+32])
 
 	// 3. Parse every header from its RLP and compute keccak hashes.
 	// Trust flows: proof -> provenBlockHash -> last RLP keccak -> earlier RLPs
@@ -395,4 +391,21 @@ func appendUint64(buf []byte, v uint64) []byte {
 func readUint64BE(b []byte) uint64 {
 	return uint64(b[0])<<56 | uint64(b[1])<<48 | uint64(b[2])<<40 | uint64(b[3])<<32 |
 		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7])
+}
+
+// parseProvenFields extracts (executionStateRoot, executionBlockHash, executionBlockNumber)
+// from the SP1 program's ABI-encoded ProofOutputs bytes. Returns a non-empty errMsg on
+// any structural problem (too short, unexpected ABI offset). No SDK calls — pure function,
+// safe to test under standard go test.
+func parseProvenFields(pvBytes []byte) (stateRoot, blockHash string, blockNumber uint64, errMsg string) {
+	if len(pvBytes) < PvMinLen {
+		return "", "", 0, "public_values too short for ABI fields"
+	}
+	if readUint64BE(pvBytes[24:32]) != PvAbiOffset {
+		return "", "", 0, "unexpected ABI tuple offset (expected 32)"
+	}
+	stateRoot = hex.EncodeToString(pvBytes[PvFieldStateRoot : PvFieldStateRoot+32])
+	blockHash = hex.EncodeToString(pvBytes[PvFieldBlockHash : PvFieldBlockHash+32])
+	blockNumber = readUint64BE(pvBytes[PvFieldBlockNumber+24 : PvFieldBlockNumber+32])
+	return
 }
