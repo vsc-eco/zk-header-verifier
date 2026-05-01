@@ -45,10 +45,14 @@ Requires the `crypto.sp1_verify_groth16` host function in go-vsc-node. See [go-v
 ## Build
 
 ```bash
-tinygo build -gc=custom -scheduler=none -panic=trap -no-debug -target=wasm-unknown -o contract.wasm ./contract/
+make            # builds bin/main.wasm via tinygo in Docker; skips if up to date
+make clean      # remove bin/*.wasm
+make test       # run Go tests on the host toolchain
 ```
 
-Compiled WASM: 179 KB (included as `contract.wasm`)
+Output: `bin/main.wasm` (~192 KB).
+
+By default the build runs inside the `tinygo/tinygo:0.39.0` Docker image. To use a host tinygo install instead: `USE_DOCKER=0 make`.
 
 ## Init parameters
 
