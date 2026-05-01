@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Cache tinygo image
+        uses: ScribeMD/docker-cache@0.5.0
+        with:
+          key: tinygo-0.41.1
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test
