@@ -15,9 +15,15 @@ WASM contract for Magi that verifies SP1 Groth16 proofs of Ethereum consensus an
 
 | Action | Caller | Description |
 |--------|--------|-------------|
-| `init` | Owner | Set Groth16 VK, VK root, and SP1 program vkey hash |
-| `updateVkey` | Owner | Update verification parameters (for SP1 version upgrades) |
-| `submitProof` | Anyone | Submit ZK proof + headers. Proof must be valid. Max 12 headers per tx. |
+| `init` | Owner | One-shot. Set Groth16 VK, VK root, SP1 program vkey hash, anchor (initial block hash + height), `expected_chain_id`, and `is_testnet`. Re-entry rejected. |
+| `propose` | Owner | Queue an admin action (`updateVkey` or `setExpectedElfHash` rotation) under the **400K-block timelock** (~14 days). Returns a proposal id. |
+| `execute` | Owner | Apply a previously-proposed action after its timelock has elapsed. |
+| `cancelProposal` | Owner | Cancel a still-pending proposal before its `execHeight`. |
+| `expireProposal` | Anyone | Permissionless garbage-collect of a proposal whose `expireHeight` has passed. |
+| `setExpectedElfHash` | Owner | **First pin only** (deploy ramp-up, no trusted prior hash to rotate from). After the first call, this action is rejected — rotations go through `propose` + `execute`. |
+| `submitProof` | Anyone | Submit ZK proof + headers. Proof must be valid. Max 12 headers per tx. Rejected if `provenChainId != expected_chain_id`. |
+
+`updateVkey` is no longer a direct wasmexport — it is reachable only via `propose` (action `"updateVkey"`) and `execute` after the 400K-block timelock (F1 fix). The init path remains the one place a vkey is installed without timelock (no trusted prior state to rotate from).
 
 ## State keys
 
@@ -62,8 +68,27 @@ After deployment, call `init` with:
 {
   "groth16_vk": "<hex: 492-byte Groth16 verification key for the SP1 version>",
   "vk_root": "<hex: 32-byte SP1 recursion VK root>",
-  "sp1_vkey_hash": "<hex: 32-byte SP1 program verification key hash>"
+  "sp1_vkey_hash": "<hex: 32-byte SP1 program verification key hash>",
+  "max_retention": 50400,
+  "initial_height": 12345678,
+  "initial_block_hash": "0x<64-hex: finalized L1 block hash at initial_height>",
+  "expected_chain_id": 1,
+  "is_testnet": false
 }
 ```
 
 These values come from the SP1-Helios fork's build output and the SP1 verifier artifacts.
+
+Required / important fields (init fails closed if missing):
+
+- `initial_height` + `initial_block_hash` — CRIT #25 anchor. The first
+  `submitProof` batch must produce a header whose `ParentHash` equals
+  `initial_block_hash`. Pick a recent finalized L1 block and its hash from a
+  trusted source. Both REQUIRED (init aborts if absent/zero).
+- `expected_chain_id` — CRIT #6 Site 6 chain binding. The L1 chainId this
+  verifier is bound to (`1` mainnet, `11155111` Sepolia). REQUIRED, non-zero;
+  `submitProof` reverts any proof whose committed chainId differs. Immutable
+  after init (no setter).
+- `max_retention` — optional; defaults to `DefaultMaxRetention` when `0`.
+- `is_testnet` — set `true` ONLY on testnet so `clearTestnetState` is
+  permitted; leave `false`/unset on mainnet (the sentinel gates that handler).
