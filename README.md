@@ -58,7 +58,7 @@ make test       # run Go tests on the host toolchain
 
 Output: `bin/main.wasm` (~192 KB).
 
-By default the build runs inside the `tinygo/tinygo:0.39.0` Docker image. To use a host tinygo install instead: `USE_DOCKER=0 make`.
+By default the build runs inside the `tinygo/tinygo:0.41.1` Docker image, pinned by immutable digest (`@sha256:b216f534…`) in the Makefile for reproducibility. To use a host tinygo install instead: `USE_DOCKER=0 make`.
 
 ## Init parameters
 

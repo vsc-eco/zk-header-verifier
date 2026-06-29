@@ -19,7 +19,10 @@ jobs:
       - name: Cache tinygo image
         uses: ScribeMD/docker-cache@0.5.0
         with:
-          key: tinygo-0.41.1
+          # MED #36: key on the immutable digest pinned in the Makefile so a
+          # re-pushed mutable tag can never reuse a stale cache under a new
+          # image. `make build` pulls tinygo/tinygo@sha256:b216f534... directly.
+          key: tinygo-sha256-b216f534ddbf277444407b014a3328b5c1ade403cc397f3ab48a14789bf99d0e
 
       - name: Build
         run: make build
