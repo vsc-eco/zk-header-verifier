@@ -48,6 +48,14 @@ const (
 	// Each header with RLP hex costs ~681 CBOR bytes. 12 × 681 + 1000 overhead = ~9172 bytes.
 	MaxHeadersPerTx = 12
 
+	// MED #65 (A1-F4): cap any RLP length descriptor. A single block header is
+	// bounded by Magi's 16KB MAX_TX_SIZE, so no legitimate length descriptor can
+	// approach this. The cap is well below 2^31 so a value narrowed to `int`
+	// (TinyGo's wasm-unknown target compiles `int` as 32-bit) is always a
+	// non-negative number — readRLPItem's `end := offset + 1 + ll + l` can never
+	// wrap negative and the downstream slices can never take a negative index.
+	MaxRLPItemLen = 1 << 24 // 16 MiB
+
 	// ProofOutputs ABI layout (alloy::abi_encode of the SP1 program's output struct).
 	//
 	// W4 Cluster B CRIT #6 Site 6 + W1-cluster-B-schema §1 LOCKED (v17.1 §G):
@@ -325,6 +333,35 @@ func submitProof(input *string) *string {
 		ce.Abort(ce.ErrInitialization, "not initialized: no sp1_vkey_hash", "submitProof")
 	}
 
+	// MED #85 (M31-G3) — cheap shape gate, runs BEFORE the expensive host verify.
+	//
+	// public_values is the ABI-encoded ProofOutputs, decoded as hex below; it
+	// must be even-length hex and long enough for parseProvenFields (>=
+	// PvMinLenWithChainId bytes). Rejecting obviously-malformed submissions here
+	// avoids spending the costly Sp1VerifyGroth16 pairing check on inputs that
+	// the post-verify decode would reject anyway. No valid proof is dropped: the
+	// post-verify decode (parseProvenFields) requires exactly this minimum.
+	//
+	// NOTE ON THE RESIDUAL DoS BOUND (do not add a per-block contract counter):
+	// the shape gate cannot stop a "correctly-sized garbage proof" — only the
+	// host pairing check can tell a valid proof from correctly-sized garbage, so
+	// such a submission necessarily reaches Sp1VerifyGroth16. A per-block counter
+	// kept in contract state CANNOT bound this: submitProof is permissionless and
+	// a failed verify ABORTS, which reverts the whole transaction (state engine
+	// commits contract state only on success — state_engine.go:1878-1895), so any
+	// counter increment is discarded on exactly the attack case. The aggregate
+	// Groth16 work an attacker can force per block is instead bounded at the HOST
+	// layer by RC/gas: the runtime charges CYCLE_GAS_PER_RC*10 for every
+	// sp1_verify_groth16 invocation regardless of proof validity
+	// (modules/wasm/sdk/sdk.go:737,739), and that RC charge is applied to the
+	// payer OUTSIDE the revert path (state_engine.go:1813-1814), so it survives
+	// the abort and is capped by the payer's RC budget. That host-layer bound is
+	// the load-bearing mitigation; this contract-side gate only short-circuits
+	// the trivially-malformed case before paying for the verify.
+	if len(params.PublicValues)%2 != 0 || len(params.PublicValues) < PvMinLenWithChainId*2 {
+		ce.Abort(ce.ErrInput, "public_values too short or odd-length hex", "submitProof")
+	}
+
 	// 1. Verify the ZK proof
 	result := sdk.Sp1VerifyGroth16(params.Proof, params.PublicValues, *sp1VkeyHash, *groth16Vk, *vkRoot)
 	if result != "true" {
@@ -584,16 +621,31 @@ func readRLPItem(buf []byte, offset int) (int, int, int, bool) {
 	}
 }
 
+// readRLPLen decodes a big-endian RLP length descriptor.
+//
+// MED #65 (A1-F4): the previous `len(buf) > 8` guard let a length up to 8 bytes
+// through and accumulated it into a plain `int`. On the 32-bit wasm-unknown
+// target any descriptor wider than 4 bytes (value > 2^31) overflows `int` to a
+// NEGATIVE number; readRLPItem then computes a negative `end`, its
+// `end > len(buf)` bound check passes (negative < len), and a negative length is
+// returned that panics the contract on the next slice — a permissionless
+// submitProof DoS. The fix accumulates in uint64 (cannot overflow for ≤8 bytes)
+// and rejects anything above MaxRLPItemLen BEFORE narrowing to int, so the
+// returned value is always in [0, 16 MiB].
 func readRLPLen(buf []byte) int {
 	if len(buf) > 8 {
 		ce.Abort(ce.ErrInput, "rlp len overflow", "submitProof")
 		return 0 // L6 review6: defense-in-depth for no-op Abort stub
 	}
-	var v int
+	var v uint64
 	for _, b := range buf {
-		v = (v << 8) | int(b)
+		v = (v << 8) | uint64(b)
 	}
-	return v
+	if v > MaxRLPItemLen {
+		ce.Abort(ce.ErrInput, "rlp item length exceeds maximum", "submitProof")
+		return 0 // defense-in-depth for no-op Abort stub
+	}
+	return int(v)
 }
 
 func readBytes32(buf []byte, offset int, out *[32]byte) int {
