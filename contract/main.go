@@ -34,13 +34,27 @@ const (
 	// 400K-block timelock — owned by Cluster B per v18 §AI).
 	KeyExpectedElfHash = "elfhash"
 
-	// W4 Cluster B CRIT #6 Site 6 enforcement: the chainId this verifier
-	// instance is bound to. Set at init from InitContractParams.ExpectedChainId.
-	// submitProof rejects any proof whose committed chainId (slot 11 of
-	// ProofOutputs) does not equal this value — otherwise a valid SP1 proof
-	// for the WRONG chain (e.g. a Sepolia proof against a mainnet verifier)
-	// would be accepted and its headers stored as authoritative.
+	// The chainId LABEL this verifier instance is bound to. Set at init from
+	// InitContractParams.ExpectedChainId. This is NOT a security check against
+	// the proof (the proof's committed chainId was spoofable); chain identity is
+	// established by genesis_root + sync-committee anchoring below. submitProof
+	// stamps this configured value into every stored header (bytes 129-136) so
+	// account-mapping's per-chain receipt checks (header.ChainId == its chainId)
+	// keep working. Required (non-zero) at init.
 	KeyExpectedChainId = "cid"
+
+	// Beacon light-client chain binding (genesis pin + sync-committee anchoring).
+	// KeyGenesisRoot: the genesis_validators_root this verifier is bound to
+	// (bare hex, immutable after init). Every proof must commit this same root.
+	// KeyBeaconHead: the last finalized beacon slot accepted (uint64 decimal);
+	// submitProof requires strictly increasing newHead (anti-replay/rollback).
+	// SyncCommitteePrefix+{period}: the trusted sync-committee hash for each
+	// period. A proof is accepted only if its prevSyncCommitteeHash equals the
+	// trusted committee for period(prevHead); the proof's committee hashes are
+	// then rotated in. Bootstrapped at init from a weak-subjectivity checkpoint.
+	KeyGenesisRoot      = "gvr"
+	KeyBeaconHead       = "bh"
+	SyncCommitteePrefix = "sc-"
 
 	DefaultMaxRetention = uint64(10000)
 
@@ -56,28 +70,40 @@ const (
 	// wrap negative and the downstream slices can never take a negative index.
 	MaxRLPItemLen = 1 << 24 // 16 MiB
 
-	// ProofOutputs ABI layout (alloy::abi_encode of the SP1 program's output struct).
-	//
-	// W4 Cluster B CRIT #6 Site 6 + W1-cluster-B-schema §1 LOCKED (v17.1 §G):
-	// 12 head slots: 10 static fields (slots 0-9) + slot 10 (storageSlots
-	// dynamic offset pointer) + slot 11 (chainId, NEW — appended last in the
-	// sol! struct definition in sp1-helios-magi/primitives/src/types.rs).
-	// This contract reads slots 5/6/7 (stateRoot/blockHash/blockNumber) for
-	// legacy reads and slot 11 (chainId) for chain-binding verification.
-	// PvMinLen=288 covers legacy slot 5/6/7 reads (kept for backward-compat
-	// parsers that don't need chainId); PvMinLenWithChainId=416 covers the
-	// full extended struct and MUST be checked before reading PvFieldChainId.
-	//
-	// Append-last position rationale: inserting chainId before storageSlots
-	// would shift the slot-10 dynamic offset pointer and break every
-	// positional decoder. Appending preserves slots 0-10 byte-for-byte.
-	PvAbiOffset         = 32                  // alloy tuple head, asserted equal at runtime
-	PvFieldStateRoot    = PvAbiOffset + 5*32  // 192
-	PvFieldBlockHash    = PvAbiOffset + 6*32  // 224
-	PvFieldBlockNumber  = PvAbiOffset + 7*32  // 256
-	PvMinLen            = PvAbiOffset + 8*32  // 288 — legacy: 8 head slots fully present
-	PvFieldChainId      = PvAbiOffset + 11*32 // 384 — slot 11 (chainId)
-	PvMinLenWithChainId = PvAbiOffset + 12*32 // 416 — 12 head slots (covers chainId read)
+	// ProofOutputs ABI layout (alloy::abi_encode of the SP1 program's output
+	// struct; see sp1-helios-magi/primitives/src/types.rs). The 32-byte tuple
+	// offset prefix occupies bytes [0:32]; tuple field N is at PvAbiOffset+N*32.
+	// Head fields (all read here except where noted):
+	//   slot 1 prevHead (uint256 beacon slot)   slot 2 prevSyncCommitteeHash
+	//   slot 3 newHead  (uint256 beacon slot)    slot 5 executionStateRoot
+	//   slot 6 executionBlockHash                slot 7 executionBlockNumber
+	//   slot 8 syncCommitteeHash                 slot 9 nextSyncCommitteeHash
+	//   slot 10 genesisRoot                      slot 11 storageSlots ptr (unread)
+	// uint256 beacon slots are read as uint64 from the low 8 bytes ([+24:+32]).
+	// PvMinLen=384 guarantees every field through genesisRoot ([352:384]) is
+	// present (a well-formed empty-storageSlots proof is 448 bytes).
+	PvAbiOffset              = 32                  // alloy tuple head, asserted equal at runtime
+	PvFieldPrevHead          = PvAbiOffset + 1*32  // 64
+	PvFieldPrevSyncCommittee = PvAbiOffset + 2*32  // 96
+	PvFieldNewHead           = PvAbiOffset + 3*32  // 128
+	PvFieldStateRoot         = PvAbiOffset + 5*32  // 192
+	PvFieldBlockHash         = PvAbiOffset + 6*32  // 224
+	PvFieldBlockNumber       = PvAbiOffset + 7*32  // 256
+	PvFieldSyncCommittee     = PvAbiOffset + 8*32  // 288
+	PvFieldNextSyncCommittee = PvAbiOffset + 9*32  // 320
+	PvFieldGenesisRoot       = PvAbiOffset + 10*32 // 352
+	PvMinLen                 = PvAbiOffset + 11*32 // 384 — through genesisRoot
+
+	// Sync-committee period math: SLOTS_PER_EPOCH(32) *
+	// EPOCHS_PER_SYNC_COMMITTEE_PERIOD(256) = 8192 slots/period (mirrors helios
+	// calc_sync_period). See syncPeriod().
+	SlotsPerSyncPeriod = uint64(8192)
+
+	// NoNextSyncCommittee — the all-0xFF sentinel the prover emits for
+	// nextSyncCommitteeHash when there is no next committee yet (light_client.rs
+	// MED Z-PR-M1: never emits zero, to avoid colliding with zero-initialized
+	// consumer storage). submitProof skips rotating this sentinel in.
+	NoNextSyncCommittee = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 )
 
 // --- Admin actions ---
@@ -86,6 +112,7 @@ const (
 // Extended with:
 //   - InitialBlockHash + InitialHeight (CRIT #25 atomic anchor backfill)
 //   - IsTestnet (Cluster E clearTestnetState gate sentinel)
+//   - GenesisRoot + InitialSyncCommitteeHash + InitialHead (beacon bootstrap)
 type InitContractParams struct {
 	Groth16Vk        string `json:"groth16_vk"`
 	VkRoot           string `json:"vk_root"`
@@ -94,10 +121,21 @@ type InitContractParams struct {
 	InitialHeight    uint64 `json:"initial_height"`
 	InitialBlockHash string `json:"initial_block_hash"`
 	IsTestnet        bool   `json:"is_testnet"`
-	// W4 Cluster B CRIT #6 Site 6: the L1 chainId this verifier is bound to
-	// (e.g. 1 mainnet, 11155111 Sepolia). submitProof enforces that every
-	// proof's committed chainId equals this. Required (non-zero) at init.
+	// The L1 chainId LABEL this verifier is bound to (e.g. 1 mainnet,
+	// 11155111 Sepolia). Stamped into stored headers for account-mapping's
+	// per-chain checks. Required (non-zero) at init. NOT a proof comparison —
+	// chain identity is established by genesis_root + sync-committee anchoring.
 	ExpectedChainId uint64 `json:"expected_chain_id"`
+
+	// Beacon light-client bootstrap (operator supplies these from a
+	// weak-subjectivity checkpoint for this chain, same provenance as
+	// initial_block_hash):
+	//   - GenesisRoot: genesis_validators_root, 32-byte hex (optional 0x).
+	//   - InitialSyncCommitteeHash: trusted committee hash at InitialHead.
+	//   - InitialHead: beacon slot of the bootstrap checkpoint (non-zero).
+	GenesisRoot              string `json:"genesis_root"`
+	InitialSyncCommitteeHash string `json:"initial_sync_committee_hash"`
+	InitialHead              uint64 `json:"initial_head"`
 }
 
 //go:wasmexport init
@@ -136,12 +174,21 @@ func initContract(input *string) *string {
 		ce.Abort(ce.ErrInput, "initial_block_hash must be 0x-prefixed 32-byte hex", "init")
 	}
 
-	// W4 Cluster B CRIT #6 Site 6: require the bound chainId. Without it,
-	// submitProof has nothing to compare provenChainId against and the
-	// chain-binding fix is inert (the bug the audit found).
+	// Require the bound chainId LABEL (stamped into stored headers; non-zero so
+	// account-mapping's "contract chainId not configured" guard never trips).
 	if params.ExpectedChainId == 0 {
-		ce.Abort(ce.ErrInput, "expected_chain_id required (non-zero) for chain-binding enforcement", "init")
+		ce.Abort(ce.ErrInput, "expected_chain_id required (non-zero)", "init")
 	}
+
+	// Beacon bootstrap: pin the chain's genesis_validators_root and seed the
+	// trusted sync committee + beacon head from a weak-subjectivity checkpoint.
+	// The first proof must commit this genesis_root and start from this
+	// committee at period(initial_head).
+	if params.GenesisRoot == "" || params.InitialSyncCommitteeHash == "" || params.InitialHead == 0 {
+		ce.Abort(ce.ErrInput, "genesis_root, initial_sync_committee_hash, and initial_head required for beacon bootstrap", "init")
+	}
+	genesisRoot := normalizeHash32(params.GenesisRoot, "genesis_root")
+	initialCommittee := normalizeHash32(params.InitialSyncCommitteeHash, "initial_sync_committee_hash")
 
 	sdk.StateSetObject(KeyGroth16Vk, params.Groth16Vk)
 	sdk.StateSetObject(KeyVkRoot, params.VkRoot)
@@ -161,11 +208,15 @@ func initContract(input *string) *string {
 	sdk.StateSetObject(KeyLastBlockHash, params.InitialBlockHash)
 	sdk.StateSetObject(KeyLastHeight, strconv.FormatUint(params.InitialHeight, 10))
 
-	// W4 Cluster B CRIT #6 Site 6: persist the bound chainId for submitProof
-	// enforcement. Immutable after init (no setter handler — chain binding
-	// must not be admin-mutable, same rationale as account-mapping dropping
-	// setChainId per CRIT #6 Site 12).
+	// Persist the chainId LABEL. Immutable after init (no setter handler — the
+	// chain a verifier instance serves must not be admin-mutable).
 	sdk.StateSetObject(KeyExpectedChainId, strconv.FormatUint(params.ExpectedChainId, 10))
+
+	// Beacon bootstrap state: pin genesis_root, seed the trusted committee for
+	// the bootstrap period, and set the initial beacon head.
+	sdk.StateSetObject(KeyGenesisRoot, genesisRoot)
+	sdk.StateSetObject(SyncCommitteePrefix+strconv.FormatUint(syncPeriod(params.InitialHead), 10), initialCommittee)
+	sdk.StateSetObject(KeyBeaconHead, strconv.FormatUint(params.InitialHead, 10))
 
 	// v20 §BG: testnet sentinel for Cluster E's clearTestnetState. ABSENCE
 	// of this key == mainnet; presence == testnet. Mainnet deploys MUST
@@ -195,6 +246,21 @@ func looksLikeBlockHash(s string) bool {
 		}
 	}
 	return true
+}
+
+// normalizeHash32 validates a 32-byte value (optional 0x prefix) and returns it
+// as canonical bare lowercase hex; aborts on bad shape. Round-tripping through
+// hex.Decode/Encode guarantees the stored form matches parseProvenFields'
+// hex.EncodeToString output byte-for-byte (so genesis/committee compares work).
+func normalizeHash32(h, field string) string {
+	if len(h) >= 2 && (h[:2] == "0x" || h[:2] == "0X") {
+		h = h[2:]
+	}
+	b, err := hex.DecodeString(h)
+	if err != nil || len(b) != 32 {
+		ce.Abort(ce.ErrInput, field+" must be 32-byte hex (64 chars, optional 0x prefix)", "init")
+	}
+	return hex.EncodeToString(b)
 }
 
 // applySetExpectedElfHash — W4 Cluster B HIGH #22 Site 12: pins the SHA-256
@@ -337,7 +403,7 @@ func submitProof(input *string) *string {
 	//
 	// public_values is the ABI-encoded ProofOutputs, decoded as hex below; it
 	// must be even-length hex and long enough for parseProvenFields (>=
-	// PvMinLenWithChainId bytes). Rejecting obviously-malformed submissions here
+	// PvMinLen bytes). Rejecting obviously-malformed submissions here
 	// avoids spending the costly Sp1VerifyGroth16 pairing check on inputs that
 	// the post-verify decode would reject anyway. No valid proof is dropped: the
 	// post-verify decode (parseProvenFields) requires exactly this minimum.
@@ -358,7 +424,7 @@ func submitProof(input *string) *string {
 	// the abort and is capped by the payer's RC budget. That host-layer bound is
 	// the load-bearing mitigation; this contract-side gate only short-circuits
 	// the trivially-malformed case before paying for the verify.
-	if len(params.PublicValues)%2 != 0 || len(params.PublicValues) < PvMinLenWithChainId*2 {
+	if len(params.PublicValues)%2 != 0 || len(params.PublicValues) < PvMinLen*2 {
 		ce.Abort(ce.ErrInput, "public_values too short or odd-length hex", "submitProof")
 	}
 
@@ -368,34 +434,57 @@ func submitProof(input *string) *string {
 		ce.Abort(ce.ErrTransaction, "proof verification failed", "submitProof")
 	}
 
-	// 2. Decode publicValues to get proven block hash, number, and chainId.
+	// 2. Decode publicValues into the proven beacon + execution fields.
 	pvBytes, err := hex.DecodeString(params.PublicValues)
 	if err != nil {
 		ce.Abort(ce.ErrInvalidHex, "invalid public_values hex", "submitProof")
 	}
-	// W4 Cluster B CRIT #6 Site 6: chainId is now returned from
-	// parseProvenFields (slot 11 of ProofOutputs).
-	provenStateRoot, provenBlockHash, provenBlockNumber, provenChainId, perr := parseProvenFields(pvBytes)
+	pf, perr := parseProvenFields(pvBytes)
 	if perr != nil {
 		ce.CustomAbort(ce.Prepend(perr, "submitProof"))
 	}
 
-	// W4 Cluster B CRIT #6 Site 6 ENFORCEMENT: reject any proof whose
-	// committed chainId does not match the chainId this verifier was bound
-	// to at init. Prior to this check the verifier parsed + stored
-	// provenChainId but never compared it, so a valid SP1 proof generated
-	// against the WRONG chain would have been accepted and its headers
-	// written as authoritative — defeating the entire chain-binding fix.
+	// 2a. CHAIN BINDING — genesis_validators_root pin. The proof must be for the
+	// beacon chain this verifier was bootstrapped against. genesisRoot is the BLS
+	// signing-domain root the sync-committee signatures were verified under
+	// in-circuit, so an attacker's fake chain carries a different root.
+	genesisPtr := sdk.StateGetObject(KeyGenesisRoot)
+	if genesisPtr == nil || *genesisPtr == "" {
+		ce.Abort(ce.ErrInitialization, "genesis_root not set; verifier must be initialized with genesis_root", "submitProof")
+	}
+	if pf.genesisRoot != *genesisPtr {
+		ce.Abort(ce.ErrTransaction, "proof genesis_validators_root does not match verifier's bound chain", "submitProof")
+	}
+
+	// 2b. CHAIN BINDING — sync-committee anchoring (the load-bearing check). The
+	// proof must START from a committee this verifier already trusts:
+	// prevSyncCommitteeHash must equal the stored committee for period(prevHead).
+	// Without this, an attacker could prove from a self-chosen (fake) committee.
+	prevPeriodKey := SyncCommitteePrefix + strconv.FormatUint(syncPeriod(pf.prevHead), 10)
+	trustedPtr := sdk.StateGetObject(prevPeriodKey)
+	if trustedPtr == nil || *trustedPtr == "" {
+		ce.Abort(ce.ErrTransaction, "no trusted sync committee for the proof's prev period", "submitProof")
+	}
+	if pf.prevSyncCommittee != *trustedPtr {
+		ce.Abort(ce.ErrTransaction, "proof's prev sync committee is not trusted", "submitProof")
+	}
+
+	// 2c. Forward progress: the beacon head must strictly advance (anti-replay /
+	// anti-rollback). Rejects re-submitting an old proof or rolling the head back.
+	if pf.newHead <= getBeaconHead() {
+		ce.Abort(ce.ErrTransaction, "beacon head not advancing", "submitProof")
+	}
+
+	// 2d. The chainId LABEL stamped into stored headers comes from this verifier's
+	// own config (NOT the proof) — chain identity is already proven above.
+	// account-mapping cross-checks this label against its own configured chainId.
 	expectedChainPtr := sdk.StateGetObject(KeyExpectedChainId)
 	if expectedChainPtr == nil || *expectedChainPtr == "" {
 		ce.Abort(ce.ErrInitialization, "expected_chain_id not set; verifier must be initialized with expected_chain_id", "submitProof")
 	}
-	expectedChainId, ecErr := strconv.ParseUint(*expectedChainPtr, 10, 64)
+	headerChainId, ecErr := strconv.ParseUint(*expectedChainPtr, 10, 64)
 	if ecErr != nil {
 		ce.Abort(ce.ErrState, "stored expected_chain_id is not a valid uint64", "submitProof")
-	}
-	if provenChainId != expectedChainId {
-		ce.Abort(ce.ErrTransaction, "proof chainId ("+strconv.FormatUint(provenChainId, 10)+") does not match verifier's bound chainId ("+strconv.FormatUint(expectedChainId, 10)+")", "submitProof")
 	}
 
 	// W4 Cluster B CRIT #25 — anchor check.
@@ -435,16 +524,16 @@ func submitProof(input *string) *string {
 	}
 
 	// 4. Bind the last header's RLP and extracted fields to the proof's public inputs.
-	if hashes[lastIdx] != provenBlockHash {
+	if hashes[lastIdx] != pf.blockHash {
 		ce.Abort(ce.ErrTransaction, "keccak256(last header RLP) != proven block hash", "submitProof")
 	}
-	if parsed[lastIdx].BlockNumber != provenBlockNumber {
+	if parsed[lastIdx].BlockNumber != pf.blockNumber {
 		ce.Abort(ce.ErrTransaction, "last header block number ("+
 			strconv.FormatUint(parsed[lastIdx].BlockNumber, 10)+
 			") != proven block number ("+
-			strconv.FormatUint(provenBlockNumber, 10)+")", "submitProof")
+			strconv.FormatUint(pf.blockNumber, 10)+")", "submitProof")
 	}
-	if hex.EncodeToString(parsed[lastIdx].StateRoot[:]) != provenStateRoot {
+	if hex.EncodeToString(parsed[lastIdx].StateRoot[:]) != pf.stateRoot {
 		ce.Abort(ce.ErrTransaction, "last header state_root != proven state root", "submitProof")
 	}
 
@@ -459,10 +548,9 @@ func submitProof(input *string) *string {
 	}
 
 	// 6. Sequential block-number check + store the RLP-extracted fields.
-	// W4 Cluster B Site 6 + §AW: every stored header gains a ChainId
-	// field populated from the proven slot-11 value. This is the
-	// authoritative ChainId for the EthBlockHeader the account-mapping
-	// contract reads downstream (CRIT #6 Site 2 ERC-20 path).
+	// Every stored header carries the verifier's configured chainId LABEL
+	// (headerChainId) at bytes 129-136. account-mapping reads it on the ERC-20
+	// receipt path and cross-checks it against its own configured chainId.
 	lastHeight := getLastHeight()
 	maxRetention := getMaxRetention()
 	for i := range parsed {
@@ -474,7 +562,7 @@ func submitProof(input *string) *string {
 			ce.Abort(ce.ErrInput, "headers not sequential within batch", "submitProof")
 		}
 
-		storeHeader(p.BlockNumber, p.StateRoot, p.TxRoot, p.RcptRoot, p.BaseFeePerGas, p.GasLimit, p.Timestamp, provenChainId)
+		storeHeader(p.BlockNumber, p.StateRoot, p.TxRoot, p.RcptRoot, p.BaseFeePerGas, p.GasLimit, p.Timestamp, headerChainId)
 		lastHeight = p.BlockNumber
 
 		if p.BlockNumber > maxRetention {
@@ -483,6 +571,17 @@ func submitProof(input *string) *string {
 	}
 
 	sdk.StateSetObject(KeyLastHeight, strconv.FormatUint(lastHeight, 10))
+
+	// CHAIN BINDING — rotate the trusted sync-committee set forward and advance
+	// the beacon head, now that every check has passed. Store the current
+	// committee for period(newHead); store the next committee for the following
+	// period unless it is the prover's "no next committee" sentinel.
+	curPeriod := syncPeriod(pf.newHead)
+	sdk.StateSetObject(SyncCommitteePrefix+strconv.FormatUint(curPeriod, 10), pf.syncCommittee)
+	if pf.nextSyncCommittee != NoNextSyncCommittee {
+		sdk.StateSetObject(SyncCommitteePrefix+strconv.FormatUint(curPeriod+1, 10), pf.nextSyncCommittee)
+	}
+	sdk.StateSetObject(KeyBeaconHead, strconv.FormatUint(pf.newHead, 10))
 
 	// W4 Cluster B CRIT #25 — update anchor for the next batch. Use the
 	// hex of the last header's keccak so the next call's parsed[0].
@@ -759,40 +858,57 @@ func readUint64BE(b []byte) uint64 {
 		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7])
 }
 
-// parseProvenFields extracts (executionStateRoot, executionBlockHash,
-// executionBlockNumber, chainId) from the SP1 program's ABI-encoded
-// ProofOutputs bytes. Returns a non-nil *ContractError on any structural
-// problem. No SDK calls — pure function, safe to test under standard
-// go test (contracterrors transitively imports sdk but its construction
-// path doesn't exercise any wasmimport).
-//
-// W4 Cluster B CRIT #6 Site 6 + S-B-v17-4 comment fix:
-//   - Extended return signature adds `chainId uint64` (slot 11).
-//   - Length check is split: legacy parsers see PvMinLen=288, chainId-aware
-//     callers MUST pass a buffer >= PvMinLenWithChainId=416.
-//   - chainId is read as uint64 big-endian from the LAST 8 bytes of the
-//     32-byte ABI slot at offset PvFieldChainId (same pattern as
-//     blockNumber). See sp1-helios-magi/primitives/src/types.rs for the
-//     authoritative sol struct.
-func parseProvenFields(pvBytes []byte) (stateRoot, blockHash string, blockNumber, chainId uint64, err *ce.ContractError) {
+// provenFields holds the values parseProvenFields extracts from the SP1
+// program's ABI-encoded ProofOutputs. The 32-byte fields are bare lowercase
+// hex; beacon slots and the execution block number are uint64 read from the low
+// 8 bytes of their 32-byte ABI slot.
+type provenFields struct {
+	stateRoot         string // executionStateRoot (slot 5)
+	blockHash         string // executionBlockHash (slot 6)
+	genesisRoot       string // genesis_validators_root (slot 10)
+	prevSyncCommittee string // committee that signed the proof (slot 2)
+	syncCommittee     string // current committee after updates (slot 8)
+	nextSyncCommittee string // next-period committee, or 0xFF sentinel (slot 9)
+	blockNumber       uint64 // executionBlockNumber (slot 7)
+	prevHead          uint64 // beacon slot the proof started from (slot 1)
+	newHead           uint64 // beacon slot the proof advanced to (slot 3)
+}
+
+// parseProvenFields decodes the SP1 ProofOutputs bytes. Returns a non-nil
+// *ContractError on any structural problem. No SDK calls — pure function, safe
+// to test under standard go test. See the ABI layout note on the Pv* constants
+// and sp1-helios-magi/primitives/src/types.rs for the authoritative sol struct.
+func parseProvenFields(pvBytes []byte) (provenFields, *ce.ContractError) {
+	var pf provenFields
 	if len(pvBytes) < PvMinLen {
-		return "", "", 0, 0, ce.NewContractError(ce.ErrInput, "public_values too short for ABI fields")
+		return pf, ce.NewContractError(ce.ErrInput, "public_values too short for ABI fields")
 	}
 	if readUint64BE(pvBytes[24:32]) != PvAbiOffset {
-		return "", "", 0, 0, ce.NewContractError(ce.ErrInput, "unexpected ABI tuple offset (expected 32)")
+		return pf, ce.NewContractError(ce.ErrInput, "unexpected ABI tuple offset (expected 32)")
 	}
-	stateRoot = hex.EncodeToString(pvBytes[PvFieldStateRoot : PvFieldStateRoot+32])
-	blockHash = hex.EncodeToString(pvBytes[PvFieldBlockHash : PvFieldBlockHash+32])
-	blockNumber = readUint64BE(pvBytes[PvFieldBlockNumber+24 : PvFieldBlockNumber+32])
-	// W4 Cluster B Site 6: chainId is in slot 11 (PvFieldChainId=384).
-	// Require the full extended length before reading; legacy callers that
-	// only need stateRoot/blockHash/blockNumber are at line above and have
-	// already been served by the PvMinLen=288 check.
-	if len(pvBytes) < PvMinLenWithChainId {
-		return "", "", 0, 0, ce.NewContractError(ce.ErrInput, "public_values too short for chainId field")
+	pf.stateRoot = hex.EncodeToString(pvBytes[PvFieldStateRoot : PvFieldStateRoot+32])
+	pf.blockHash = hex.EncodeToString(pvBytes[PvFieldBlockHash : PvFieldBlockHash+32])
+	pf.genesisRoot = hex.EncodeToString(pvBytes[PvFieldGenesisRoot : PvFieldGenesisRoot+32])
+	pf.prevSyncCommittee = hex.EncodeToString(pvBytes[PvFieldPrevSyncCommittee : PvFieldPrevSyncCommittee+32])
+	pf.syncCommittee = hex.EncodeToString(pvBytes[PvFieldSyncCommittee : PvFieldSyncCommittee+32])
+	pf.nextSyncCommittee = hex.EncodeToString(pvBytes[PvFieldNextSyncCommittee : PvFieldNextSyncCommittee+32])
+	pf.blockNumber = readUint64BE(pvBytes[PvFieldBlockNumber+24 : PvFieldBlockNumber+32])
+	pf.prevHead = readUint64BE(pvBytes[PvFieldPrevHead+24 : PvFieldPrevHead+32])
+	pf.newHead = readUint64BE(pvBytes[PvFieldNewHead+24 : PvFieldNewHead+32])
+	return pf, nil
+}
+
+// syncPeriod maps a beacon slot to its sync-committee period.
+func syncPeriod(slot uint64) uint64 { return slot / SlotsPerSyncPeriod }
+
+// getBeaconHead returns the last accepted finalized beacon slot (0 if unset).
+func getBeaconHead() uint64 {
+	data := sdk.StateGetObject(KeyBeaconHead)
+	if data == nil || *data == "" {
+		return 0
 	}
-	chainId = readUint64BE(pvBytes[PvFieldChainId+24 : PvFieldChainId+32])
-	return
+	v, _ := strconv.ParseUint(*data, 10, 64)
+	return v
 }
 
 // ===== F1 fix: admin propose/execute timelock (was contract/timelock.go) =====
