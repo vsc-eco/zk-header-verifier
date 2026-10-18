@@ -475,6 +475,18 @@ func submitProof(input *string) *string {
 		ce.Abort(ce.ErrTransaction, "beacon head not advancing", "submitProof")
 	}
 
+	// RV-4 (RV re-verify): bind prevHead to the stored beacon head. Without this,
+	// 2b only required the proof's start committee to be *some* trusted period —
+	// so a proof planted at a future period (via the committee-injection below)
+	// could be consumed out of order. Requiring prevHead == the last accepted
+	// head forces every proof to continue the one canonical chain this verifier
+	// has already accepted, closing the "start from any trusted period" gap that
+	// the missing upstream #54 reset would otherwise open. The bootstrap proof
+	// (beaconHead == InitialHead set at init) must start exactly from it.
+	if pf.prevHead != getBeaconHead() {
+		ce.Abort(ce.ErrTransaction, "proof prev_head does not continue the stored beacon head", "submitProof")
+	}
+
 	// 2d. The chainId LABEL stamped into stored headers comes from this verifier's
 	// own config (NOT the proof) — chain identity is already proven above.
 	// account-mapping cross-checks this label against its own configured chainId.
@@ -577,9 +589,18 @@ func submitProof(input *string) *string {
 	// committee for period(newHead); store the next committee for the following
 	// period unless it is the prover's "no next committee" sentinel.
 	curPeriod := syncPeriod(pf.newHead)
-	sdk.StateSetObject(SyncCommitteePrefix+strconv.FormatUint(curPeriod, 10), pf.syncCommittee)
+	// RV-4 (RV re-verify): write committees SET-IF-EMPTY with a mismatch revert,
+	// mirroring upstream SP1Helios.sol. The SP1 program does not reset
+	// store.next_sync_committee between proofs (missing upstream #54), so a
+	// prover could commit an UNVERIFIED next committee. Pre-fix this verifier
+	// stored sc-{curPeriod+1} unconditionally, so that bogus committee became
+	// trusted and a second proof could start from it and forge finality. Only
+	// writing an empty slot — and reverting if a proof ever disagrees with a
+	// committee already trusted for a period — means a committee can only be set
+	// by the proof that first legitimately rotates into its period.
+	storeTrustedCommittee(curPeriod, pf.syncCommittee)
 	if pf.nextSyncCommittee != NoNextSyncCommittee {
-		sdk.StateSetObject(SyncCommitteePrefix+strconv.FormatUint(curPeriod+1, 10), pf.nextSyncCommittee)
+		storeTrustedCommittee(curPeriod+1, pf.nextSyncCommittee)
 	}
 	sdk.StateSetObject(KeyBeaconHead, strconv.FormatUint(pf.newHead, 10))
 
@@ -896,6 +917,23 @@ func parseProvenFields(pvBytes []byte) (provenFields, *ce.ContractError) {
 	pf.prevHead = readUint64BE(pvBytes[PvFieldPrevHead+24 : PvFieldPrevHead+32])
 	pf.newHead = readUint64BE(pvBytes[PvFieldNewHead+24 : PvFieldNewHead+32])
 	return pf, nil
+}
+
+// storeTrustedCommittee writes the trusted sync-committee hash for a period
+// SET-IF-EMPTY (RV-4). If the slot is empty it is written; if it already holds
+// the same hash it is a no-op; if it holds a DIFFERENT hash the proof is trying
+// to overwrite an already-trusted committee (the committee-injection path the
+// missing upstream #54 reset enables) and the whole submission is reverted.
+func storeTrustedCommittee(period uint64, committee string) {
+	key := SyncCommitteePrefix + strconv.FormatUint(period, 10)
+	existing := sdk.StateGetObject(key)
+	if existing != nil && *existing != "" {
+		if *existing != committee {
+			ce.Abort(ce.ErrTransaction, "sync committee for this period is already trusted and differs — refusing to overwrite", "submitProof")
+		}
+		return
+	}
+	sdk.StateSetObject(key, committee)
 }
 
 // syncPeriod maps a beacon slot to its sync-committee period.
