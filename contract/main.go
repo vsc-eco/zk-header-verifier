@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"encoding/json"
+	"slices"
 	"strconv"
 	ce "zk-header-verifier/contract/contracterrors"
 	"zk-header-verifier/sdk"
@@ -812,8 +813,9 @@ func readUintField(buf []byte, offset int) (int, uint64) {
 // misread chainId or baseFee.
 //
 // Layout (LOCKED, mirrors account-mapping/contract/blocklist/blocks.go):
-//   [version:1][blockNumber:8][stateRoot:32][txRoot:32][rcptRoot:32]
-//   [baseFee:8][gasLimit:8][timestamp:8][chainId:8] = 137 bytes.
+//
+//	[version:1][blockNumber:8][stateRoot:32][txRoot:32][rcptRoot:32]
+//	[baseFee:8][gasLimit:8][timestamp:8][chainId:8] = 137 bytes.
 const HeaderVersionV1 byte = 0x01
 const HeaderSerializedSize = 137
 
@@ -853,7 +855,8 @@ func getMaxRetention() uint64 {
 }
 
 func checkOwner() {
-	caller := sdk.GetEnv().Caller.String()
+	env := sdk.GetEnv()
+	caller := env.Caller.String()
 	owner := sdk.GetEnvKey("contract.owner")
 	// review6 closure (F11 / INFO-11): reject the degenerate
 	// "owner=='' && caller==''" pass-through. Without this, an
@@ -866,6 +869,14 @@ func checkOwner() {
 	}
 	if caller != *owner {
 		ce.Abort(ce.ErrNoPermission, "owner required", "auth")
+	}
+	// A2: a posting-only signature makes its signer the Caller too, so the
+	// owner's posting key (the one handed to front ends) passed this gate: it
+	// could pin the ELF hash and propose / execute a vkey rotation, the whole
+	// ZK trust root. Require the owner's active authority, as the
+	// account-mapping bridge and the BTC mapping contract do.
+	if !slices.Contains(env.Sender.RequiredAuths, env.Caller) {
+		ce.Abort(ce.ErrNoPermission, "owner active authority required", "auth")
 	}
 }
 
