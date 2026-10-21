@@ -57,6 +57,18 @@ const (
 	KeyBeaconHead       = "bh"
 	SyncCommitteePrefix = "sc-"
 
+	// E5: an open header gap (see submitHeaders). A proof's batch carries at
+	// most MaxHeadersPerTx headers, but ~32 blocks lie between finalized
+	// checkpoints, so a batch need not reach the stored chain. It is then
+	// stored and the blocks below it are backfilled: KeyGapWant is the bare hex
+	// hash the next (older) header must have, KeyGapLow the lowest height
+	// stored so far, KeyGapBase / KeyGapAnchor the stored chain's tip height and
+	// bare hex hash the backfill must meet.
+	KeyGapWant   = "gapw"
+	KeyGapLow    = "gapl"
+	KeyGapBase   = "gapb"
+	KeyGapAnchor = "gapa"
+
 	// B13: the bridge proves a deposit or a mined withdrawal against the
 	// header of its own block, so a header pruned before that proof lands
 	// strands it: past retention a deposit can never be credited and the
@@ -396,6 +408,11 @@ func submitProof(input *string) *string {
 		ce.Abort(ce.ErrInput, "too many headers (max "+strconv.Itoa(MaxHeadersPerTx)+")", "submitProof")
 	}
 
+	// E5: one gap at a time; the operator backfills right after its proof.
+	if g := sdk.StateGetObject(KeyGapWant); g != nil && *g != "" {
+		ce.Abort(ce.ErrTransaction, "a header gap is open below the last proven block; fill it with submitHeaders first", "submitProof")
+	}
+
 	// Load verification parameters
 	groth16Vk := sdk.StateGetObject(KeyGroth16Vk)
 	if groth16Vk == nil || *groth16Vk == "" {
@@ -542,7 +559,14 @@ func submitProof(input *string) *string {
 	// chain at exactly `parsed[0].ParentHash == lastBlockHash`. This
 	// closes the "unbound prevHeader" gap that let any well-formed proof
 	// for ANY hash chain land regardless of the contract's prior history.
-	if hex.EncodeToString(parsed[0].ParentHash[:]) != anchorHex {
+	//
+	// E5: a batch that does not reach the anchor (its first header is above
+	// the stored tip + 1) opens a gap instead, filled by submitHeaders: every
+	// header stays keccak-bound to this proven block, and the gap closes only
+	// when the backfill meets the anchor.
+	lastHeight := getLastHeight()
+	contiguous := hex.EncodeToString(parsed[0].ParentHash[:]) == anchorHex
+	if !contiguous && parsed[0].BlockNumber <= lastHeight+1 {
 		ce.Abort(ce.ErrTransaction, "parent hash of first header does not match stored anchor (lastBlockHash)", "submitProof")
 	}
 
@@ -574,8 +598,14 @@ func submitProof(input *string) *string {
 	// Every stored header carries the verifier's configured chainId LABEL
 	// (headerChainId) at bytes 129-136. account-mapping reads it on the ERC-20
 	// receipt path and cross-checks it against its own configured chainId.
-	lastHeight := getLastHeight()
 	maxRetention := getMaxRetention()
+	if !contiguous {
+		sdk.StateSetObject(KeyGapWant, hex.EncodeToString(parsed[0].ParentHash[:]))
+		sdk.StateSetObject(KeyGapLow, strconv.FormatUint(parsed[0].BlockNumber, 10))
+		sdk.StateSetObject(KeyGapBase, strconv.FormatUint(lastHeight, 10))
+		sdk.StateSetObject(KeyGapAnchor, anchorHex)
+		lastHeight = parsed[0].BlockNumber - 1
+	}
 	for i := range parsed {
 		p := parsed[i]
 		if lastHeight > 0 && p.BlockNumber != lastHeight+1 {
@@ -623,6 +653,94 @@ func submitProof(input *string) *string {
 	// off-chain tooling reads back identical to what was supplied).
 	sdk.StateSetObject(KeyLastBlockHash, "0x"+hashes[lastIdx])
 	return nil
+}
+
+// SubmitHeadersParams carries a backfill batch for an open gap, oldest first.
+type SubmitHeadersParams struct {
+	Headers []SubmittedHeader `json:"headers"`
+}
+
+// submitHeaders backfills an open gap (E5) from its top down. The batch's last
+// header must hash to the gap's wanted hash (the parent of the lowest stored
+// header, which is keccak-bound to a proven block), and the batch must chain
+// by parent hash with sequential heights; so every stored header descends to a
+// proven block. Permissionless: there is nothing to choose, only the one chain
+// that hashes into the proof. The gap closes when the batch meets the stored
+// chain below it; a batch that reaches that height without linking to it
+// fails closed.
+//
+//go:wasmexport submitHeaders
+func submitHeaders(input *string) *string {
+	var params SubmitHeadersParams
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.Abort(ce.ErrJson, "invalid JSON: "+err.Error(), "submitHeaders")
+	}
+	if len(params.Headers) == 0 || len(params.Headers) > MaxHeadersPerTx {
+		ce.Abort(ce.ErrInput, "1 to "+strconv.Itoa(MaxHeadersPerTx)+" headers required", "submitHeaders")
+	}
+	wantPtr := sdk.StateGetObject(KeyGapWant)
+	if wantPtr == nil || *wantPtr == "" {
+		ce.Abort(ce.ErrTransaction, "no header gap is open", "submitHeaders")
+	}
+	low, _ := strconv.ParseUint(stateOr(KeyGapLow, "0"), 10, 64)
+	base, _ := strconv.ParseUint(stateOr(KeyGapBase, "0"), 10, 64)
+	gapAnchor := stateOr(KeyGapAnchor, "")
+
+	lastIdx := len(params.Headers) - 1
+	parsed := make([]parsedHeader, len(params.Headers))
+	hashes := make([]string, len(params.Headers))
+	for i, h := range params.Headers {
+		parsed[i] = parseHeader(h.RlpHex)
+		hashes[i] = sdk.Keccak256(h.RlpHex)
+	}
+	if hashes[lastIdx] != *wantPtr || parsed[lastIdx].BlockNumber+1 != low {
+		ce.Abort(ce.ErrTransaction, "last header is not the parent of the lowest backfilled header", "submitHeaders")
+	}
+	for i := lastIdx - 1; i >= 0; i-- {
+		if hex.EncodeToString(parsed[i+1].ParentHash[:]) != hashes[i] || parsed[i].BlockNumber+1 != parsed[i+1].BlockNumber {
+			ce.Abort(ce.ErrTransaction, "hash chain broken at block "+strconv.FormatUint(parsed[i].BlockNumber, 10), "submitHeaders")
+		}
+	}
+	if parsed[0].BlockNumber <= base {
+		ce.Abort(ce.ErrInput, "backfill reaches below the stored chain", "submitHeaders")
+	}
+	chainId, _ := strconv.ParseUint(stateOr(KeyExpectedChainId, "0"), 10, 64)
+	// Same retention as submitProof: keep the last maxRetention heights below
+	// the proven tip. A backfilled height already outside it is linked, not
+	// stored, and the height maxRetention below each one is pruned (submitProof
+	// pruned only below the heights it stored).
+	tip := getLastHeight()
+	maxRetention := getMaxRetention()
+	for _, p := range parsed {
+		if p.BlockNumber+maxRetention > tip {
+			storeHeader(p.BlockNumber, p.StateRoot, p.TxRoot, p.RcptRoot, p.BaseFeePerGas, p.GasLimit, p.Timestamp, chainId)
+		}
+		if p.BlockNumber > maxRetention {
+			sdk.StateDeleteObject(KeyBlockPrefix + strconv.FormatUint(p.BlockNumber-maxRetention, 10))
+		}
+	}
+	if parsed[0].BlockNumber == base+1 {
+		if hex.EncodeToString(parsed[0].ParentHash[:]) != gapAnchor {
+			ce.Abort(ce.ErrTransaction, "backfill does not meet the stored chain (parent of block "+
+				strconv.FormatUint(parsed[0].BlockNumber, 10)+" is not the stored tip)", "submitHeaders")
+		}
+		for _, k := range []string{KeyGapWant, KeyGapLow, KeyGapBase, KeyGapAnchor} {
+			sdk.StateDeleteObject(k)
+		}
+		return nil
+	}
+	sdk.StateSetObject(KeyGapWant, hex.EncodeToString(parsed[0].ParentHash[:]))
+	sdk.StateSetObject(KeyGapLow, strconv.FormatUint(parsed[0].BlockNumber, 10))
+	return nil
+}
+
+// stateOr reads a state key, or def when unset (the runtime reads a missing
+// key as "").
+func stateOr(key, def string) string {
+	if v := sdk.StateGetObject(key); v != nil && *v != "" {
+		return *v
+	}
+	return def
 }
 
 // --- RLP decoder ---
