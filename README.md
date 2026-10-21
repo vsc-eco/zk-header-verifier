@@ -46,7 +46,7 @@ WASM contract for Magi that verifies SP1 Groth16 proofs of Ethereum consensus an
 - Hash chain verification: every header's `keccak256(RLP)` verified against proven block hash
 - Parent hash chain: each header's parentHash must equal `keccak256(RLP)` of the previous header
 - Sequential block numbers enforced
-- Max 12 headers per transaction (16KB tx size limit)
+- Max 12 headers per call; the node caps a call's payload at 8192 bytes, which fits ~5 Prague headers next to a proof and ~6 in a backfill
 - Backfilled headers hash into a proven block the same way; the gap closes only where the backfill links to the stored chain, and fails closed otherwise
 - Old headers pruned automatically (`max_retention`, default 50,400 blocks / 7 days, at least 7,200); backfill keeps the same window
 - Storage dominates the cost: ~2,640 RC per stored header (19 RC a written byte), so relaying every block takes ~19M RC a day
