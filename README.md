@@ -9,7 +9,8 @@ WASM contract for Magi that verifies SP1 Groth16 proofs of Ethereum consensus an
 3. The contract verifies the proof via the `crypto.sp1_verify_groth16` host function
 4. The contract verifies the hash chain: `keccak256(RLP(header))` must match the ZK-proven block hash
 5. Verified headers are stored in the same format as the EVM mapping contract's blocklist
-6. The EVM bridge reads verified headers via `contracts.read(verifierContractId, key)`
+6. A proof's batch holds at most 12 headers but finalized checkpoints are ~32 blocks apart, so a batch that does not reach the stored chain opens a gap: its headers are stored and `submitHeaders` backfills the blocks below them, newest first, until the backfill meets the stored chain. No new proof is accepted while a gap is open
+7. The EVM bridge reads verified headers via `contracts.read(verifierContractId, key)`
 
 ## Actions
 
@@ -21,7 +22,8 @@ WASM contract for Magi that verifies SP1 Groth16 proofs of Ethereum consensus an
 | `cancelProposal` | Owner | Cancel a still-pending proposal before its `execHeight`. |
 | `expireProposal` | Anyone | Permissionless garbage-collect of a proposal whose `expireHeight` has passed. |
 | `setExpectedElfHash` | Owner | **First pin only** (deploy ramp-up, no trusted prior hash to rotate from). After the first call, this action is rejected — rotations go through `propose` + `execute`. |
-| `submitProof` | Anyone | Submit ZK proof + headers. Proof must be valid. Max 12 headers per tx. Rejected if `provenChainId != expected_chain_id`. |
+| `submitProof` | Anyone | Submit ZK proof + headers. Proof must be valid. Max 12 headers per tx. The proof must continue the stored beacon head from a trusted sync committee on the bound chain (`genesis_root`). A batch above the stored tip + 1 that does not link to it opens a gap; refused while a gap is open. |
+| `submitHeaders` | Anyone | Backfill an open gap: up to 12 headers, oldest first, the last one the parent of the lowest stored header. Closes the gap when the batch starts at the stored tip + 1 and links to it; refused (gap stays open) if it does not link. |
 
 `updateVkey` is no longer a direct wasmexport — it is reachable only via `propose` (action `"updateVkey"`) and `execute` after the 400K-block timelock (F1 fix). The init path remains the one place a vkey is installed without timelock (no trusted prior state to rotate from).
 
@@ -30,7 +32,10 @@ WASM contract for Magi that verifies SP1 Groth16 proofs of Ethereum consensus an
 | Key | Value | Compatible with |
 |-----|-------|-----------------|
 | `h` | Last verified block height | evm-mapping-contract `GetLastHeight()` |
-| `b-{N}` | 128-byte binary block header | evm-mapping-contract `GetHeader(N)` |
+| `b-{N}` | 137-byte binary block header (v1, chainId label last) | evm-mapping-contract `GetHeader(N)` |
+| `lbh` | Hash of the newest stored header (`0x`-prefixed) | — |
+| `gapw` / `gapl` | Open gap: hash the next backfilled header must have / lowest backfilled height | — |
+| `gapb` / `gapa` | Open gap: stored tip height and hash the backfill must meet | — |
 | `vk` | Groth16 VK hex | — |
 | `vr` | VK root hex | — |
 | `sp1vk` | SP1 program vkey hash hex | — |
@@ -42,7 +47,9 @@ WASM contract for Magi that verifies SP1 Groth16 proofs of Ethereum consensus an
 - Parent hash chain: each header's parentHash must equal `keccak256(RLP)` of the previous header
 - Sequential block numbers enforced
 - Max 12 headers per transaction (16KB tx size limit)
-- Old headers pruned automatically (10,000 block retention)
+- Backfilled headers hash into a proven block the same way; the gap closes only where the backfill links to the stored chain, and fails closed otherwise
+- Old headers pruned automatically (`max_retention`, default 50,400 blocks / 7 days, at least 7,200); backfill keeps the same window
+- Storage dominates the cost: ~2,640 RC per stored header (19 RC a written byte), so relaying every block takes ~19M RC a day
 
 ## Prerequisites
 
@@ -81,14 +88,16 @@ These values come from the SP1-Helios fork's build output and the SP1 verifier a
 
 Required / important fields (init fails closed if missing):
 
-- `initial_height` + `initial_block_hash` — CRIT #25 anchor. The first
-  `submitProof` batch must produce a header whose `ParentHash` equals
-  `initial_block_hash`. Pick a recent finalized L1 block and its hash from a
-  trusted source. Both REQUIRED (init aborts if absent/zero).
-- `expected_chain_id` — CRIT #6 Site 6 chain binding. The L1 chainId this
-  verifier is bound to (`1` mainnet, `11155111` Sepolia). REQUIRED, non-zero;
-  `submitProof` reverts any proof whose committed chainId differs. Immutable
-  after init (no setter).
+- `initial_height` + `initial_block_hash` — CRIT #25 anchor. The stored
+  chain starts at this block: the first proof's batch either links to it or
+  opens a gap that `submitHeaders` backfills down to it. Pick a recent
+  finalized L1 block and its hash from a trusted source. Both REQUIRED (init
+  aborts if absent/zero).
+- `expected_chain_id` — the L1 chainId label (`1` mainnet, `11155111`
+  Sepolia) stamped into every stored header, which account-mapping checks
+  against its own chainId. REQUIRED, non-zero. It is not compared with the
+  proof: chain identity comes from `genesis_root` and the sync committee.
+  Immutable after init (no setter).
 - `max_retention` — optional; defaults to `DefaultMaxRetention` when `0`.
 - `is_testnet` — set `true` ONLY on testnet so `clearTestnetState` is
   permitted; leave `false`/unset on mainnet (the sentinel gates that handler).
