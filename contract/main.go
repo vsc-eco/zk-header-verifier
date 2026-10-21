@@ -57,7 +57,14 @@ const (
 	KeyBeaconHead       = "bh"
 	SyncCommitteePrefix = "sc-"
 
-	DefaultMaxRetention = uint64(10000)
+	// B13: the bridge proves a deposit or a mined withdrawal against the
+	// header of its own block, so a header pruned before that proof lands
+	// strands it: past retention a deposit can never be credited and the
+	// in-flight withdrawal can never be confirmed or proven dropped. 10,000 ETH
+	// blocks was ~33 h, shorter than a bridge-bot outage can last. The default
+	// is 7 days (the BTC bridge keeps ~7.5) and init refuses less than a day.
+	DefaultMaxRetention = uint64(50_400)
+	MinMaxRetention     = uint64(7_200)
 
 	// Max headers per transaction. Limited by Magi's 16KB MAX_TX_SIZE.
 	// Each header with RLP hex costs ~681 CBOR bytes. 12 × 681 + 1000 overhead = ~9172 bytes.
@@ -198,6 +205,9 @@ func initContract(input *string) *string {
 	retention := params.MaxRetention
 	if retention == 0 {
 		retention = DefaultMaxRetention
+	}
+	if retention < MinMaxRetention {
+		ce.Abort(ce.ErrInput, "max_retention must be at least "+strconv.FormatUint(MinMaxRetention, 10)+" blocks (one day)", "init")
 	}
 	sdk.StateSetObject(KeyMaxRetention, strconv.FormatUint(retention, 10))
 
