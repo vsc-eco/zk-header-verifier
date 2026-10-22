@@ -64,7 +64,10 @@ func storeHeader(blockNumber uint64, stateRoot, txRoot, rcptRoot [32]byte, baseF
 //go:wasmexport init
 func initContract(input *string) *string {
 	// Mark testnet sentinel; the mock is inert as a production verifier
-	// (it has no submitProof / groth16 path at all). Idempotent.
+	// (it has no submitProof / groth16 path at all). Idempotent. Anyone can
+	// call init, so the sentinel does not stop devSetHeader on a deployed mock:
+	// only never deploying the mock to mainnet (and the bridge's timelocked
+	// setVerifierContract) does.
 	sdk.StateSetObject("is_testnet", "true")
 	return nil
 }
