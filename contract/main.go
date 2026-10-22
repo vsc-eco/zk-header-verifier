@@ -78,8 +78,9 @@ const (
 	DefaultMaxRetention = uint64(50_400)
 	MinMaxRetention     = uint64(7_200)
 
-	// Max headers per transaction. Limited by Magi's 16KB MAX_TX_SIZE.
-	// Each header with RLP hex costs ~681 CBOR bytes. 12 × 681 + 1000 overhead = ~9172 bytes.
+	// Max headers per transaction. The binding limit is the node's 8192-byte
+	// contract payload cap (MAX_CONTRACT_PAYLOAD_SIZE): about 5 Prague headers
+	// next to a proof and 6 in a backfill, so 12 is never reached in practice.
 	MaxHeadersPerTx = 12
 
 	// MED #65 (A1-F4): cap any RLP length descriptor. A single block header is
