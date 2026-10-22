@@ -175,6 +175,9 @@ func SetTestCaller(addr string) {
 	testEnvJSON = `{"contract.id":"contract:test","msg.caller":"` + addr + `","msg.sender":"` + addr + `","msg.required_auths":["` + addr + `"]}`
 }
 
+// SetTestEnvJSON replaces the whole env (e.g. a posting-only signer).
+func SetTestEnvJSON(env string) { testEnvJSON = env }
+
 // SetTestHaltOnAbort makes abort/revert panic, as the runtime halts the call.
 // Off by default: the review6 tests check the post-abort zero returns a
 // runtime that did not halt would see.
