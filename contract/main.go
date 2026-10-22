@@ -715,7 +715,7 @@ func submitHeaders(input *string) *string {
 	tip := getLastHeight()
 	maxRetention := getMaxRetention()
 	for _, p := range parsed {
-		if p.BlockNumber+maxRetention > tip {
+		if p.BlockNumber > tip || tip-p.BlockNumber < maxRetention { // no uint64 wrap for a huge retention
 			storeHeader(p.BlockNumber, p.StateRoot, p.TxRoot, p.RcptRoot, p.BaseFeePerGas, p.GasLimit, p.Timestamp, chainId)
 		}
 		if p.BlockNumber > maxRetention {
