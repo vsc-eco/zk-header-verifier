@@ -23,6 +23,7 @@ package main
 import (
 	"encoding/hex"
 	"encoding/json"
+	"slices"
 	"strconv"
 
 	ce "zk-header-verifier/contract/contracterrors"
@@ -65,9 +66,8 @@ func storeHeader(blockNumber uint64, stateRoot, txRoot, rcptRoot [32]byte, baseF
 func initContract(input *string) *string {
 	// Mark testnet sentinel; the mock is inert as a production verifier
 	// (it has no submitProof / groth16 path at all). Idempotent. Anyone can
-	// call init, so the sentinel does not stop devSetHeader on a deployed mock:
-	// only never deploying the mock to mainnet (and the bridge's timelocked
-	// setVerifierContract) does.
+	// call init, so the sentinel alone does not stop devSetHeader on a
+	// deployed mock; requireOwner does.
 	sdk.StateSetObject("is_testnet", "true")
 	return nil
 }
@@ -98,10 +98,27 @@ func hexRoot(s, field string) [32]byte {
 	return out
 }
 
+// requireOwner (Z-1): devSetHeader plants headers with no proof, so only the
+// mock's owner (its deployer) with active authority may call it, as the real
+// verifier's checkOwner. The is_testnet sentinel does not guard it (anyone can
+// call init): a mock deployed by mistake and wired as a bridge's verifier
+// would let anyone plant a header and prove a deposit that never happened.
+func requireOwner() {
+	env := sdk.GetEnv()
+	owner := sdk.GetEnvKey("contract.owner")
+	if owner == nil || *owner == "" || env.Caller.String() != *owner {
+		ce.Abort(ce.ErrNoPermission, "devSetHeader: owner required", "devSetHeader")
+	}
+	if !slices.Contains(env.Sender.RequiredAuths, env.Caller) {
+		ce.Abort(ce.ErrNoPermission, "devSetHeader: owner active authority required", "devSetHeader")
+	}
+}
+
 //go:wasmexport devSetHeader
 func devSetHeader(input *string) *string {
-	// DEVNET ONLY: plant a header with real roots, no proof. Guarded by the
-	// testnet sentinel so an accidental mainnet deploy cannot inject headers.
+	// DEVNET ONLY: plant a header with real roots, no proof. Only the owner
+	// (requireOwner); the sentinel stays as a second check.
+	requireOwner()
 	if t := sdk.StateGetObject("is_testnet"); t == nil || *t != "true" {
 		ce.Abort(ce.ErrState, "devSetHeader is devnet-only (is_testnet sentinel unset)", "devSetHeader")
 	}
