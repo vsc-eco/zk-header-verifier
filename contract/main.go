@@ -228,7 +228,10 @@ func initContract(input *string) *string {
 	// this anchor. Seeded values come from the W0 operator runbook P5 step
 	// (operator selects a recent finalized L1 block, queries its hash via
 	// any trusted source, includes here at deploy time).
-	sdk.StateSetObject(KeyLastBlockHash, params.InitialBlockHash)
+	// Stored as 0x + lowercase hex, the form submitProof writes it in: the
+	// anchor is compared with lowercase keccak hex, so an uppercase value would
+	// never match (and, behind an E5 gap, would leave the gap open for good).
+	sdk.StateSetObject(KeyLastBlockHash, "0x"+normalizeHash32(params.InitialBlockHash, "initial_block_hash"))
 	sdk.StateSetObject(KeyLastHeight, strconv.FormatUint(params.InitialHeight, 10))
 
 	// Persist the chainId LABEL. Immutable after init (no setter handler — the
