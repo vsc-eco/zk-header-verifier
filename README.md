@@ -16,7 +16,7 @@ WASM contract for Magi that verifies SP1 Groth16 proofs of Ethereum consensus an
 
 | Action | Caller | Description |
 |--------|--------|-------------|
-| `init` | Owner | One-shot. Set Groth16 VK, VK root, SP1 program vkey hash, anchor (initial block hash + height), `expected_chain_id`, and `is_testnet`. Re-entry rejected. |
+| `init` | Owner | One-shot. Set Groth16 VK, VK root, SP1 program vkey hash, anchor (initial block hash + height), `expected_chain_id`, the beacon bootstrap (`genesis_root`, `initial_sync_committee_hash`, `initial_head`), and `is_testnet`. Re-entry rejected. |
 | `propose` | Owner | Queue an admin action (`updateVkey` or `setExpectedElfHash` rotation) under the **400K-block timelock** (~14 days). Returns a proposal id. |
 | `execute` | Owner | Apply a previously-proposed action after its timelock has elapsed. |
 | `cancelProposal` | Owner | Cancel a still-pending proposal before its `execHeight`. |
@@ -80,11 +80,14 @@ After deployment, call `init` with:
   "initial_height": 12345678,
   "initial_block_hash": "0x<64-hex: finalized L1 block hash at initial_height>",
   "expected_chain_id": 1,
+  "genesis_root": "0x<64-hex: the chain's genesis validators root>",
+  "initial_sync_committee_hash": "0x<64-hex: hash of the current sync committee at initial_head>",
+  "initial_head": 12345664,
   "is_testnet": false
 }
 ```
 
-These values come from the SP1-Helios fork's build output and the SP1 verifier artifacts.
+Generate the whole payload with `magi_genesis` in sp1-helios-magi (see its README). It takes every field from one beacon light-client bootstrap at a finalized checkpoint, checks the anchor against that beacon header, and prints the VK, VK root and program vkey of the SP1 version and ELF the operator proves with. It sends nothing; review the output, then call `init`.
 
 Required / important fields (init fails closed if missing):
 
@@ -98,6 +101,15 @@ Required / important fields (init fails closed if missing):
   against its own chainId. REQUIRED, non-zero. It is not compared with the
   proof: chain identity comes from `genesis_root` and the sync committee.
   Immutable after init (no setter).
-- `max_retention` — optional; defaults to `DefaultMaxRetention` when `0`.
+- `genesis_root`, `initial_sync_committee_hash`, `initial_head` — the beacon
+  bootstrap. `genesis_root` pins the chain: every proof must commit it.
+  `initial_sync_committee_hash` seeds the trusted committee for
+  period(`initial_head`), and the first proof must start from that committee.
+  `initial_head` is the bootstrap's checkpoint slot (a multiple of 32);
+  `magi_genesis` takes the anchor above from the execution block that
+  checkpoint finalizes. All three REQUIRED (init aborts if any is absent or
+  zero).
+- `max_retention` — optional; defaults to `DefaultMaxRetention` (50,400 blocks,
+  about 7 days) when `0`, and must be at least `MinMaxRetention` (7,200).
 - `is_testnet` — set `true` ONLY on testnet so `clearTestnetState` is
   permitted; leave `false`/unset on mainnet (the sentinel gates that handler).
