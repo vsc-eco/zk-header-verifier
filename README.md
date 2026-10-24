@@ -89,6 +89,8 @@ After deployment, call `init` with:
 
 Generate the whole payload with `magi_genesis` in sp1-helios-magi (see its README). It takes every field from one beacon light-client bootstrap at a finalized checkpoint, checks the anchor against that beacon header, and prints the VK, VK root and program vkey of the SP1 version and ELF the operator proves with. It sends nothing; review the output, then call `init`.
 
+The checkpoint is this verifier's trust root: for a real init, run `magi_genesis` without `--slot` (its checkpoint then comes from checkpoint-sync services, independent of the consensus RPC); with `--slot`, compare the checkpoint root it prints with an independent source first.
+
 Required / important fields (init fails closed if missing):
 
 - `initial_height` + `initial_block_hash` — CRIT #25 anchor. The stored
