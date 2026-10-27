@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"slices"
@@ -57,30 +58,58 @@ const (
 	KeyBeaconHead       = "bh"
 	SyncCommitteePrefix = "sc-"
 
-	// E5: an open header gap (see submitHeaders). A proof's batch carries at
-	// most MaxHeadersPerTx headers, but ~32 blocks lie between finalized
-	// checkpoints, so a batch need not reach the stored chain. It is then
-	// stored and the blocks below it are backfilled: KeyGapWant is the bare hex
-	// hash the next (older) header must have, KeyGapLow the lowest height
-	// stored so far, KeyGapBase / KeyGapAnchor the stored chain's tip height and
-	// bare hex hash the backfill must meet.
-	KeyGapWant   = "gapw"
-	KeyGapLow    = "gapl"
-	KeyGapBase   = "gapb"
-	KeyGapAnchor = "gapa"
+	// RP-9: no header backfill. Storing every Ethereum header (~7,200 a day)
+	// cost ~19M RC a day. Now a proof stores only its own batch (the proven
+	// block and any headers below it that hash into it), and the header of any
+	// other block the bridge needs is stored on demand:
+	//   - attestHeaders proves it with an EIP-2935 storage proof against a
+	//     stored header's state root (attestHistoryRoot first stores the
+	//     history contract's storage root for that header);
+	//   - submitHeaders links a run of headers down from a stored one by
+	//     parent hash (the fallback for blocks no stored root's window covers).
+	// KeyParentPrefix+{N}: the parent hash of stored header N (32 raw bytes).
+	// KeyHistoryRootPrefix+{N}: the history contract's storage root in the
+	// state of stored block N (32 raw bytes).
+	KeyParentPrefix      = "ph-"
+	KeyHistoryRootPrefix = "hr-"
 
-	// B13: the bridge proves a deposit or a mined withdrawal against the
-	// header of its own block, so a header pruned before that proof lands
-	// strands it: past retention a deposit can never be credited and the
-	// in-flight withdrawal can never be confirmed or proven dropped. 10,000 ETH
-	// blocks was ~33 h, shorter than a bridge-bot outage can last. The default
-	// is 7 days (the BTC bridge keeps ~7.5) and init refuses less than a day.
-	DefaultMaxRetention = uint64(50_400)
+	// RP-6: a stored header is kept MaxRetention L1 blocks (of the proven tip
+	// "h") from when it was stored, whatever its height, then pruned, oldest
+	// stored first. KeyStoreLogPrefix+{seq} = "{height}:{tip when stored}";
+	// KeyStoreLogHead is the oldest live seq, KeyStoreLogTail the next one.
+	// Each store prunes at most PrunePerStore expired entries.
+	KeyStoreLogPrefix = "sl-"
+	KeyStoreLogHead   = "slh"
+	KeyStoreLogTail   = "slt"
+	PrunePerStore     = 2
+
+	// B13 / RP-6: the bridge proves a deposit or a mined withdrawal against
+	// the header of its own block, so a header pruned before that proof lands
+	// strands it. Headers are now stored only for blocks the bridge uses, so
+	// they can be kept long: the default is 90 days from when each was stored
+	// (a header older than that can still be stored again, see
+	// attestHeaders / submitHeaders). init refuses less than a day.
+	DefaultMaxRetention = uint64(648_000)
 	MinMaxRetention     = uint64(7_200)
+
+	// EIP-2935 (Prague): the history contract keeps the hashes of the last
+	// HistoryServeWindow blocks in its storage, block X at slot X % 8191,
+	// written by the protocol at the start of block X+1. So the state of block
+	// R holds the hashes of blocks R-8191 .. R-1. Its code, and so its code
+	// hash, is the same on every chain (the EIP's keyless deployment); checked
+	// on mainnet and Sepolia 2026-10-27.
+	HistoryContractHex = "0000f90827f1c53a10cb7a02335b175320002935"
+	HistoryCodeHashHex = "6e49e66782037c0555897870e29fa5e552daf4719552131a0abce779daec0a5d"
+	HistoryServeWindow = uint64(8191)
+
+	// MaxProofNodes bounds an MPT proof (as account-mapping's verifier does).
+	// A mainnet account proof is 8-9 nodes, a history storage proof 4-5.
+	MaxProofNodes = 20
 
 	// Max headers per transaction. The binding limit is the node's 8192-byte
 	// contract payload cap (MAX_CONTRACT_PAYLOAD_SIZE): about 5 Prague headers
-	// next to a proof and 6 in a backfill, so 12 is never reached in practice.
+	// next to a proof, 6 in submitHeaders and 2 in attestHeaders (each with
+	// its storage proof), so 12 is never reached in practice.
 	MaxHeadersPerTx = 12
 
 	// MED #65 (A1-F4): cap any RLP length descriptor. A single block header is
@@ -412,11 +441,6 @@ func submitProof(input *string) *string {
 		ce.Abort(ce.ErrInput, "too many headers (max "+strconv.Itoa(MaxHeadersPerTx)+")", "submitProof")
 	}
 
-	// E5: one gap at a time; the operator backfills right after its proof.
-	if g := sdk.StateGetObject(KeyGapWant); g != nil && *g != "" {
-		ce.Abort(ce.ErrTransaction, "a header gap is open below the last proven block; fill it with submitHeaders first", "submitProof")
-	}
-
 	// Load verification parameters
 	groth16Vk := sdk.StateGetObject(KeyGroth16Vk)
 	if groth16Vk == nil || *groth16Vk == "" {
@@ -531,47 +555,22 @@ func submitProof(input *string) *string {
 		ce.Abort(ce.ErrState, "stored expected_chain_id is not a valid uint64", "submitProof")
 	}
 
-	// W4 Cluster B CRIT #25 — anchor check.
-	// Read the cross-batch anchor BEFORE parsing headers. Without an
-	// anchor (empty or zero hash), every prior submission state is
-	// untrusted and a forged "first batch" could inject arbitrary state.
-	// initContract MUST have set this; the InitContractParams.
-	// InitialBlockHash guard at init time prevents zero-anchor deploys.
-	anchorPtr := sdk.StateGetObject(KeyLastBlockHash)
-	if anchorPtr == nil || *anchorPtr == "" || *anchorPtr == "0x0000000000000000000000000000000000000000000000000000000000000000" {
-		ce.Abort(ce.ErrInitialization, "lastBlockHash anchor not set; call initContract with initial_block_hash", "submitProof")
-	}
-	anchorHex := *anchorPtr
-	// Strip 0x prefix to compare against the keccak hex (which is bare hex).
-	if len(anchorHex) >= 2 && (anchorHex[0:2] == "0x" || anchorHex[0:2] == "0X") {
-		anchorHex = anchorHex[2:]
-	}
-
 	// 3. Parse every header from its RLP and compute keccak hashes.
 	// Trust flows: proof -> provenBlockHash -> last RLP keccak -> earlier RLPs
 	// via parentHash chain -> all extracted fields from each RLP.
+	//
+	// RP-9: the batch no longer has to reach the stored chain (CRIT #25's
+	// anchor, then E5's gap and backfill). The proof is bound to the chain by
+	// the genesis pin and the sync-committee anchoring above (2a, 2b, RV-4),
+	// and every header in the batch hashes into the proven block, so nothing
+	// below the batch has to be stored. The header of any other block the
+	// bridge uses is stored on demand (attestHeaders, submitHeaders).
 	lastIdx := len(params.Headers) - 1
 	parsed := make([]parsedHeader, len(params.Headers))
 	hashes := make([]string, len(params.Headers))
 	for i, h := range params.Headers {
 		parsed[i] = parseHeader(h.RlpHex)
 		hashes[i] = sdk.Keccak256(h.RlpHex)
-	}
-
-	// W4 Cluster B CRIT #25 — cross-batch parent check.
-	// The first header in this batch MUST extend the previously-stored
-	// chain at exactly `parsed[0].ParentHash == lastBlockHash`. This
-	// closes the "unbound prevHeader" gap that let any well-formed proof
-	// for ANY hash chain land regardless of the contract's prior history.
-	//
-	// E5: a batch that does not reach the anchor (its first header is above
-	// the stored tip + 1) opens a gap instead, filled by submitHeaders: every
-	// header stays keccak-bound to this proven block, and the gap closes only
-	// when the backfill meets the anchor.
-	lastHeight := getLastHeight()
-	contiguous := hex.EncodeToString(parsed[0].ParentHash[:]) == anchorHex
-	if !contiguous && parsed[0].BlockNumber <= lastHeight+1 {
-		ce.Abort(ce.ErrTransaction, "parent hash of first header does not match stored anchor (lastBlockHash)", "submitProof")
 	}
 
 	// 4. Bind the last header's RLP and extracted fields to the proof's public inputs.
@@ -590,44 +589,25 @@ func submitProof(input *string) *string {
 
 	// 5. Walk the keccak chain backward. parentHash comes from the parsed RLP,
 	// so if this passes, every earlier header's RLP is bound to a real ancestor.
-	for i := lastIdx - 1; i >= 0; i-- {
-		expectedParent := hex.EncodeToString(parsed[i+1].ParentHash[:])
-		if expectedParent != hashes[i] {
-			ce.Abort(ce.ErrTransaction, "hash chain broken at block "+
-				strconv.FormatUint(parsed[i].BlockNumber, 10), "submitProof")
-		}
+	if msg := checkLinked(parsed, hashes); msg != "" {
+		ce.Abort(ce.ErrTransaction, msg, "submitProof")
 	}
 
-	// 6. Sequential block-number check + store the RLP-extracted fields.
-	// Every stored header carries the verifier's configured chainId LABEL
-	// (headerChainId) at bytes 129-136. account-mapping reads it on the ERC-20
-	// receipt path and cross-checks it against its own configured chainId.
-	maxRetention := getMaxRetention()
-	if !contiguous {
-		sdk.StateSetObject(KeyGapWant, hex.EncodeToString(parsed[0].ParentHash[:]))
-		sdk.StateSetObject(KeyGapLow, strconv.FormatUint(parsed[0].BlockNumber, 10))
-		sdk.StateSetObject(KeyGapBase, strconv.FormatUint(lastHeight, 10))
-		sdk.StateSetObject(KeyGapAnchor, anchorHex)
-		lastHeight = parsed[0].BlockNumber - 1
+	// 6. The proven tip only moves forward: account-mapping prices withdrawals
+	// from its header and measures withdrawal expiry against it.
+	tip := pf.blockNumber
+	if tip <= getLastHeight() {
+		ce.Abort(ce.ErrTransaction, "proven block "+strconv.FormatUint(tip, 10)+
+			" does not advance the stored tip "+strconv.FormatUint(getLastHeight(), 10), "submitProof")
 	}
+	sdk.StateSetObject(KeyLastHeight, strconv.FormatUint(tip, 10))
+
+	// 7. Store the batch. Every stored header carries the verifier's configured
+	// chainId LABEL (headerChainId) at bytes 129-136. account-mapping reads it
+	// on the ERC-20 receipt path and cross-checks it against its own chainId.
 	for i := range parsed {
-		p := parsed[i]
-		if lastHeight > 0 && p.BlockNumber != lastHeight+1 {
-			ce.Abort(ce.ErrInput, "block heights must be sequential", "submitProof")
-		}
-		if i > 0 && p.BlockNumber != parsed[i-1].BlockNumber+1 {
-			ce.Abort(ce.ErrInput, "headers not sequential within batch", "submitProof")
-		}
-
-		storeHeader(p.BlockNumber, p.StateRoot, p.TxRoot, p.RcptRoot, p.BaseFeePerGas, p.GasLimit, p.Timestamp, headerChainId)
-		lastHeight = p.BlockNumber
-
-		if p.BlockNumber > maxRetention {
-			sdk.StateDeleteObject(KeyBlockPrefix + strconv.FormatUint(p.BlockNumber-maxRetention, 10))
-		}
+		storeVerifiedHeader(parsed[i], headerChainId, tip)
 	}
-
-	sdk.StateSetObject(KeyLastHeight, strconv.FormatUint(lastHeight, 10))
 
 	// CHAIN BINDING — rotate the trusted sync-committee set forward and advance
 	// the beacon head, now that every check has passed. Store the current
@@ -649,29 +629,38 @@ func submitProof(input *string) *string {
 	}
 	sdk.StateSetObject(KeyBeaconHead, strconv.FormatUint(pf.newHead, 10))
 
-	// W4 Cluster B CRIT #25 — update anchor for the next batch. Use the
-	// hex of the last header's keccak so the next call's parsed[0].
-	// ParentHash check has a canonical form to match against. Prepend 0x
-	// for consistency with the InitialBlockHash format (initContract
-	// validates 0x-prefixed input; stored value retains the prefix so
-	// off-chain tooling reads back identical to what was supplied).
+	// The newest proven block's hash, 0x-prefixed (the form initContract stores
+	// initial_block_hash in). Informational since RP-9: nothing links to it.
 	sdk.StateSetObject(KeyLastBlockHash, "0x"+hashes[lastIdx])
 	return nil
 }
 
-// SubmitHeadersParams carries a backfill batch for an open gap, oldest first.
+// checkLinked reports how a batch fails to be a run of consecutive blocks,
+// each the parent of the next ("" when it is one). hashes[i] is
+// keccak256(header i) as bare lowercase hex.
+func checkLinked(parsed []parsedHeader, hashes []string) string {
+	for i := len(parsed) - 2; i >= 0; i-- {
+		if hex.EncodeToString(parsed[i+1].ParentHash[:]) != hashes[i] || parsed[i].BlockNumber+1 != parsed[i+1].BlockNumber {
+			return "hash chain broken at block " + strconv.FormatUint(parsed[i].BlockNumber, 10)
+		}
+	}
+	return ""
+}
+
+// SubmitHeadersParams carries headers to link below a stored header, oldest first.
 type SubmitHeadersParams struct {
 	Headers []SubmittedHeader `json:"headers"`
 }
 
-// submitHeaders backfills an open gap (E5) from its top down. The batch's last
-// header must hash to the gap's wanted hash (the parent of the lowest stored
-// header, which is keccak-bound to a proven block), and the batch must chain
-// by parent hash with sequential heights; so every stored header descends to a
-// proven block. Permissionless: there is nothing to choose, only the one chain
-// that hashes into the proof. The gap closes when the batch meets the stored
-// chain below it; a batch that reaches that height without linking to it
-// fails closed.
+// submitHeaders stores a run of headers linked by parent hash down from a
+// stored header: the RP-9 fallback for a block that no stored header's EIP-2935
+// window covers (more than 8,191 blocks below every stored root, e.g. after a
+// long bridge outage), and for blocks just below a proven one. The batch is
+// oldest first; its last header must hash to the stored parent hash of the
+// header right above it (ph-{last+1}), and each header must be the parent of
+// the next, so every header descends from a stored (proven or attested) one.
+// Permissionless: only the one chain that hashes into it can be stored. It
+// never moves the proven tip.
 //
 //go:wasmexport submitHeaders
 func submitHeaders(input *string) *string {
@@ -682,14 +671,6 @@ func submitHeaders(input *string) *string {
 	if len(params.Headers) == 0 || len(params.Headers) > MaxHeadersPerTx {
 		ce.Abort(ce.ErrInput, "1 to "+strconv.Itoa(MaxHeadersPerTx)+" headers required", "submitHeaders")
 	}
-	wantPtr := sdk.StateGetObject(KeyGapWant)
-	if wantPtr == nil || *wantPtr == "" {
-		ce.Abort(ce.ErrTransaction, "no header gap is open", "submitHeaders")
-	}
-	low, _ := strconv.ParseUint(stateOr(KeyGapLow, "0"), 10, 64)
-	base, _ := strconv.ParseUint(stateOr(KeyGapBase, "0"), 10, 64)
-	gapAnchor := stateOr(KeyGapAnchor, "")
-
 	lastIdx := len(params.Headers) - 1
 	parsed := make([]parsedHeader, len(params.Headers))
 	hashes := make([]string, len(params.Headers))
@@ -697,45 +678,449 @@ func submitHeaders(input *string) *string {
 		parsed[i] = parseHeader(h.RlpHex)
 		hashes[i] = sdk.Keccak256(h.RlpHex)
 	}
-	if hashes[lastIdx] != *wantPtr || parsed[lastIdx].BlockNumber+1 != low {
-		ce.Abort(ce.ErrTransaction, "last header is not the parent of the lowest backfilled header", "submitHeaders")
+	above := sdk.StateGetObject(KeyParentPrefix + strconv.FormatUint(parsed[lastIdx].BlockNumber+1, 10))
+	if above == nil || len(*above) != 32 || hex.EncodeToString([]byte(*above)) != hashes[lastIdx] {
+		ce.Abort(ce.ErrTransaction, "block "+strconv.FormatUint(parsed[lastIdx].BlockNumber, 10)+
+			" is not the stored parent of the header above it", "submitHeaders")
 	}
-	for i := lastIdx - 1; i >= 0; i-- {
-		if hex.EncodeToString(parsed[i+1].ParentHash[:]) != hashes[i] || parsed[i].BlockNumber+1 != parsed[i+1].BlockNumber {
-			ce.Abort(ce.ErrTransaction, "hash chain broken at block "+strconv.FormatUint(parsed[i].BlockNumber, 10), "submitHeaders")
-		}
+	if msg := checkLinked(parsed, hashes); msg != "" {
+		ce.Abort(ce.ErrTransaction, msg, "submitHeaders")
 	}
-	if parsed[0].BlockNumber <= base {
-		ce.Abort(ce.ErrInput, "backfill reaches below the stored chain", "submitHeaders")
-	}
-	chainId, _ := strconv.ParseUint(stateOr(KeyExpectedChainId, "0"), 10, 64)
-	// Same retention as submitProof: keep the last maxRetention heights below
-	// the proven tip. A backfilled height already outside it is linked, not
-	// stored, and the height maxRetention below each one is pruned (submitProof
-	// pruned only below the heights it stored).
+	chainId := stateUint(KeyExpectedChainId)
 	tip := getLastHeight()
-	maxRetention := getMaxRetention()
 	for _, p := range parsed {
-		if p.BlockNumber > tip || tip-p.BlockNumber < maxRetention { // no uint64 wrap for a huge retention
-			storeHeader(p.BlockNumber, p.StateRoot, p.TxRoot, p.RcptRoot, p.BaseFeePerGas, p.GasLimit, p.Timestamp, chainId)
-		}
-		if p.BlockNumber > maxRetention {
-			sdk.StateDeleteObject(KeyBlockPrefix + strconv.FormatUint(p.BlockNumber-maxRetention, 10))
-		}
+		storeVerifiedHeader(p, chainId, tip)
 	}
-	if parsed[0].BlockNumber == base+1 {
-		if hex.EncodeToString(parsed[0].ParentHash[:]) != gapAnchor {
-			ce.Abort(ce.ErrTransaction, "backfill does not meet the stored chain (parent of block "+
-				strconv.FormatUint(parsed[0].BlockNumber, 10)+" is not the stored tip)", "submitHeaders")
-		}
-		for _, k := range []string{KeyGapWant, KeyGapLow, KeyGapBase, KeyGapAnchor} {
-			sdk.StateDeleteObject(k)
-		}
+	return nil
+}
+
+// AttestHistoryRootParams carries the EIP-2935 history contract's account
+// proof in the state of stored block BlockNumber.
+type AttestHistoryRootParams struct {
+	BlockNumber  uint64 `json:"block_number"`
+	AccountProof string `json:"account_proof"` // base64: the concatenated MPT nodes
+}
+
+// attestHistoryRoot stores the history contract's storage root in the state of
+// a stored block R (hr-{R}), proven by its account proof against R's stored
+// state root. attestHeaders then proves block hashes against it. Two calls,
+// because an account proof (8-9 nodes, ~3.8 KB) and a storage proof with its
+// header (~2.4 KB) do not fit one 8 KB payload. Any stored header can be the
+// root: a proven one, or one attested from an earlier root (its state root is
+// the real one, since its hash is). Permissionless.
+//
+//go:wasmexport attestHistoryRoot
+func attestHistoryRoot(input *string) *string {
+	var params AttestHistoryRootParams
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.Abort(ce.ErrJson, "invalid JSON: "+err.Error(), "attestHistoryRoot")
+	}
+	n := strconv.FormatUint(params.BlockNumber, 10)
+	if v := sdk.StateGetObject(KeyHistoryRootPrefix + n); v != nil && len(*v) == 32 {
+		return nil // already stored; the same block always has the same root
+	}
+	hdr := sdk.StateGetObject(KeyBlockPrefix + n)
+	if hdr == nil || len(*hdr) < HeaderSerializedSize {
+		ce.Abort(ce.ErrTransaction, "block "+n+" is not stored", "attestHistoryRoot")
 		return nil
 	}
-	sdk.StateSetObject(KeyGapWant, hex.EncodeToString(parsed[0].ParentHash[:]))
-	sdk.StateSetObject(KeyGapLow, strconv.FormatUint(parsed[0].BlockNumber, 10))
+	var stateRoot [32]byte
+	copy(stateRoot[:], (*hdr)[9:41]) // [version:1][blockNumber:8][stateRoot:32]
+	addr, _ := hex.DecodeString(HistoryContractHex)
+	val, msg := mptVerify(stateRoot, hostKeccak(addr), decodeProofNodes(params.AccountProof, "account_proof"))
+	if msg != "" {
+		ce.Abort(ce.ErrTransaction, "account_proof: "+msg, "attestHistoryRoot")
+	}
+	fields, ok := rlpStrings(val, 4)
+	if !ok || len(fields[2]) != 32 || len(fields[3]) != 32 {
+		ce.Abort(ce.ErrTransaction, "account_proof: the account is not [nonce, balance, storageRoot, codeHash]", "attestHistoryRoot")
+		return nil
+	}
+	if hex.EncodeToString(fields[3]) != HistoryCodeHashHex {
+		ce.Abort(ce.ErrTransaction, "account_proof: the account's code is not the EIP-2935 history contract", "attestHistoryRoot")
+	}
+	sdk.StateSetObject(KeyHistoryRootPrefix+n, string(fields[2]))
 	return nil
+}
+
+// AttestedHeader is a header with the storage proof of its hash in the history
+// contract.
+type AttestedHeader struct {
+	RlpHex       string `json:"rlp_hex"`
+	StorageProof string `json:"storage_proof"` // base64: the concatenated MPT nodes
+}
+
+// AttestHeadersParams carries headers to prove against stored block RootBlock's
+// history root.
+type AttestHeadersParams struct {
+	RootBlock uint64           `json:"root_block"`
+	Headers   []AttestedHeader `json:"headers"`
+}
+
+// attestHeaders stores the headers of blocks RootBlock-8191 .. RootBlock-1:
+// for each, the storage proof of slot X % 8191 against hr-{RootBlock} must hold
+// keccak256(header). That slot holds block X's hash in the state of RootBlock
+// only inside that window (EIP-2935 overwrites it 8,191 blocks later).
+// Permissionless; it never moves the proven tip.
+//
+//go:wasmexport attestHeaders
+func attestHeaders(input *string) *string {
+	var params AttestHeadersParams
+	if err := json.Unmarshal([]byte(*input), &params); err != nil {
+		ce.Abort(ce.ErrJson, "invalid JSON: "+err.Error(), "attestHeaders")
+	}
+	if len(params.Headers) == 0 || len(params.Headers) > MaxHeadersPerTx {
+		ce.Abort(ce.ErrInput, "1 to "+strconv.Itoa(MaxHeadersPerTx)+" headers required", "attestHeaders")
+	}
+	r := params.RootBlock
+	rootPtr := sdk.StateGetObject(KeyHistoryRootPrefix + strconv.FormatUint(r, 10))
+	if rootPtr == nil || len(*rootPtr) != 32 {
+		ce.Abort(ce.ErrTransaction, "no history root for block "+strconv.FormatUint(r, 10)+"; call attestHistoryRoot first", "attestHeaders")
+		return nil
+	}
+	var storageRoot [32]byte
+	copy(storageRoot[:], *rootPtr)
+	chainId := stateUint(KeyExpectedChainId)
+	tip := getLastHeight()
+	for _, h := range params.Headers {
+		p := parseHeader(h.RlpHex)
+		x := p.BlockNumber
+		if x >= r || r-x > HistoryServeWindow {
+			ce.Abort(ce.ErrInput, "block "+strconv.FormatUint(x, 10)+" is outside the history window of block "+
+				strconv.FormatUint(r, 10)+" (it holds the previous "+strconv.FormatUint(HistoryServeWindow, 10)+" blocks)", "attestHeaders")
+		}
+		slot := make([]byte, 32)
+		putUint64BE(slot[24:], x%HistoryServeWindow)
+		val, msg := mptVerify(storageRoot, hostKeccak(slot), decodeProofNodes(h.StorageProof, "storage_proof"))
+		if msg != "" {
+			ce.Abort(ce.ErrTransaction, "storage_proof of block "+strconv.FormatUint(x, 10)+": "+msg, "attestHeaders")
+		}
+		got, ok := storageWord(val)
+		if !ok || hex.EncodeToString(got[:]) != sdk.Keccak256(h.RlpHex) {
+			ce.Abort(ce.ErrTransaction, "block "+strconv.FormatUint(x, 10)+
+				"'s header does not hash to the block hash the history contract holds", "attestHeaders")
+		}
+		storeVerifiedHeader(p, chainId, tip)
+	}
+	return nil
+}
+
+// storeVerifiedHeader stores header p and its parent hash unless p's height is
+// already stored, logs it for pruning and prunes expired headers. The caller
+// has verified p. tip is the proven tip it is stored at.
+func storeVerifiedHeader(p parsedHeader, chainId, tip uint64) {
+	n := strconv.FormatUint(p.BlockNumber, 10)
+	if v := sdk.StateGetObject(KeyBlockPrefix + n); v != nil && *v != "" {
+		return // the same block: a stored header is never replaced
+	}
+	storeHeader(p.BlockNumber, p.StateRoot, p.TxRoot, p.RcptRoot, p.BaseFeePerGas, p.GasLimit, p.Timestamp, chainId)
+	sdk.StateSetObject(KeyParentPrefix+n, string(p.ParentHash[:]))
+	tail := stateUint(KeyStoreLogTail)
+	sdk.StateSetObject(KeyStoreLogPrefix+strconv.FormatUint(tail, 10), n+":"+strconv.FormatUint(tip, 10))
+	sdk.StateSetObject(KeyStoreLogTail, strconv.FormatUint(tail+1, 10))
+	pruneStored(tip)
+}
+
+// pruneStored deletes up to PrunePerStore headers (with their parent hash and
+// history root) stored more than MaxRetention L1 blocks of the proven tip ago,
+// oldest stored first. Entries are in store order and tip never decreases, so
+// the oldest entry is the first to expire.
+func pruneStored(tip uint64) {
+	head := stateUint(KeyStoreLogHead)
+	tail := stateUint(KeyStoreLogTail)
+	maxRetention := getMaxRetention()
+	moved := false
+	for i := 0; i < PrunePerStore && head < tail; i++ {
+		key := KeyStoreLogPrefix + strconv.FormatUint(head, 10)
+		height, storedAt, ok := splitLogEntry(stateOr(key, ""))
+		if ok && (storedAt > tip || tip-storedAt <= maxRetention) {
+			break
+		}
+		if ok {
+			n := strconv.FormatUint(height, 10)
+			sdk.StateDeleteObject(KeyBlockPrefix + n)
+			sdk.StateDeleteObject(KeyParentPrefix + n)
+			sdk.StateDeleteObject(KeyHistoryRootPrefix + n)
+		}
+		sdk.StateDeleteObject(key)
+		head++
+		moved = true
+	}
+	if moved {
+		sdk.StateSetObject(KeyStoreLogHead, strconv.FormatUint(head, 10))
+	}
+}
+
+// splitLogEntry parses a store-log entry "{height}:{tip when stored}".
+func splitLogEntry(e string) (uint64, uint64, bool) {
+	for i := 0; i < len(e); i++ {
+		if e[i] == ':' {
+			h, err1 := strconv.ParseUint(e[:i], 10, 64)
+			t, err2 := strconv.ParseUint(e[i+1:], 10, 64)
+			return h, t, err1 == nil && err2 == nil
+		}
+	}
+	return 0, 0, false
+}
+
+// stateUint reads a decimal state value, 0 when unset.
+func stateUint(key string) uint64 {
+	v, _ := strconv.ParseUint(stateOr(key, "0"), 10, 64)
+	return v
+}
+
+// --- Merkle-Patricia proofs (RP-9) ---
+
+// hostKeccak is keccak256(b) as raw bytes (the host hashes hex).
+func hostKeccak(b []byte) []byte {
+	out, err := hex.DecodeString(sdk.Keccak256(hex.EncodeToString(b)))
+	if err != nil || len(out) != 32 {
+		ce.Abort(ce.ErrState, "keccak256 failed", "keccak")
+	}
+	return out
+}
+
+// decodeProofNodes splits a base64 proof of concatenated RLP-encoded MPT nodes
+// (the encoding account-mapping takes its tx and receipt proofs in, EVM-T1).
+func decodeProofNodes(b64, field string) [][]byte {
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil || len(data) == 0 {
+		ce.Abort(ce.ErrInput, field+" must be non-empty base64", "proof")
+		return nil
+	}
+	var nodes [][]byte
+	for off := 0; off < len(data); {
+		if len(nodes) == MaxProofNodes {
+			ce.Abort(ce.ErrInput, field+" has more than "+strconv.Itoa(MaxProofNodes)+" nodes", "proof")
+			return nil
+		}
+		_, _, next, isList := readRLPItem(data, off)
+		if !isList {
+			ce.Abort(ce.ErrInput, field+": a node is not an RLP list", "proof")
+			return nil
+		}
+		nodes = append(nodes, data[off:next])
+		off = next
+	}
+	return nodes
+}
+
+// mptVerify returns the value stored under key in the Merkle-Patricia trie with
+// the given root, read from proof (the nodes on the key's path), or a reason it
+// cannot. It follows go-ethereum's trie.VerifyProof, as account-mapping's
+// contract/mpt port does (CRIT #4): every node is fetched by its keccak256,
+// starting from the root; a child is a 32-byte hash, an empty string (none) or
+// a node embedded in its parent (at most 32 bytes encoded); a key the proof
+// shows absent is an error. Values come back as stored: the caller decodes them.
+func mptVerify(root [32]byte, key []byte, proof [][]byte) ([]byte, string) {
+	if len(proof) == 0 || len(proof) > MaxProofNodes {
+		return nil, "the proof must have 1 to " + strconv.Itoa(MaxProofNodes) + " nodes"
+	}
+	db := make(map[string][]byte, len(proof))
+	for _, n := range proof {
+		db[sdk.Keccak256(hex.EncodeToString(n))] = n
+	}
+	nib := keybytesToHex(key)
+	want := hex.EncodeToString(root[:])
+	for fetched := 0; fetched < len(proof); fetched++ {
+		node, ok := db[want]
+		if !ok {
+			return nil, "a proof node is missing (or the root does not match)"
+		}
+		for {
+			kind, ref, rest := mptStep(node, nib)
+			nib = rest
+			switch kind {
+			case refHash:
+				want = hex.EncodeToString(ref)
+			case refEmbedded:
+				node = ref
+				continue
+			case refValue:
+				return ref, ""
+			case refNone:
+				return nil, "the key is not in the trie"
+			default:
+				return nil, "invalid trie node"
+			}
+			break
+		}
+	}
+	return nil, "the proof ends before the value"
+}
+
+const (
+	refInvalid = iota
+	refNone
+	refHash
+	refEmbedded
+	refValue
+)
+
+// mptStep follows key through one node (go-ethereum's decodeNode + get): it
+// returns what the key leads to and the rest of the key.
+func mptStep(node, key []byte) (int, []byte, []byte) {
+	items, ok := rlpItems(node)
+	if !ok {
+		return refInvalid, nil, nil
+	}
+	switch len(items) {
+	case 17: // branch: 16 children, then a value
+		if len(key) == 0 {
+			return refInvalid, nil, nil
+		}
+		if key[0] == 16 {
+			v, isList := items[16].str(node)
+			if isList {
+				return refInvalid, nil, nil
+			}
+			if len(v) == 0 {
+				return refNone, nil, nil
+			}
+			return refValue, v, key[1:]
+		}
+		kind, ref := decodeRef(node, items[key[0]])
+		return kind, ref, key[1:]
+	case 2: // leaf or extension
+		k, isList := items[0].str(node)
+		if isList {
+			return refInvalid, nil, nil
+		}
+		path := compactToHex(k)
+		if len(key) < len(path) || string(key[:len(path)]) != string(path) {
+			return refNone, nil, nil
+		}
+		if len(path) > 0 && path[len(path)-1] == 16 { // leaf
+			v, isList := items[1].str(node)
+			if isList {
+				return refInvalid, nil, nil
+			}
+			return refValue, v, key[len(path):]
+		}
+		kind, ref := decodeRef(node, items[1])
+		return kind, ref, key[len(path):]
+	}
+	return refInvalid, nil, nil
+}
+
+// decodeRef reads a child reference (go-ethereum trie.decodeRef).
+func decodeRef(node []byte, it rlpItem) (int, []byte) {
+	if it.isList {
+		if it.end-it.off > 32 {
+			return refInvalid, nil // an embedded node must be shorter than a hash
+		}
+		return refEmbedded, node[it.off:it.end]
+	}
+	v, _ := it.str(node)
+	switch len(v) {
+	case 0:
+		return refNone, nil
+	case 32:
+		return refHash, v
+	}
+	return refInvalid, nil
+}
+
+// rlpItem is one item of an RLP list: its encoding is node[off:end], its
+// payload node[start:start+n].
+type rlpItem struct {
+	off, start, n, end int
+	isList             bool
+}
+
+func (it rlpItem) str(node []byte) ([]byte, bool) {
+	return node[it.start : it.start+it.n], it.isList
+}
+
+// rlpItems splits buf, which must be exactly one RLP list, into its items.
+func rlpItems(buf []byte) ([]rlpItem, bool) {
+	if len(buf) == 0 {
+		return nil, false
+	}
+	start, n, end, isList := readRLPItem(buf, 0)
+	if !isList || end != len(buf) {
+		return nil, false
+	}
+	var items []rlpItem
+	for off := start; off < start+n; {
+		s, l, next, il := readRLPItem(buf, off)
+		if next > start+n || len(items) == 17 {
+			return nil, false
+		}
+		items = append(items, rlpItem{off: off, start: s, n: l, end: next, isList: il})
+		off = next
+	}
+	return items, true
+}
+
+// rlpStrings decodes buf as exactly one RLP list of want strings.
+func rlpStrings(buf []byte, want int) ([][]byte, bool) {
+	items, ok := rlpItems(buf)
+	if !ok || len(items) != want {
+		return nil, false
+	}
+	out := make([][]byte, want)
+	for i, it := range items {
+		v, isList := it.str(buf)
+		if isList {
+			return nil, false
+		}
+		out[i] = v
+	}
+	return out, true
+}
+
+// storageWord decodes a storage-trie value: the RLP string of the 32-byte word
+// with its leading zero bytes removed (zero itself is never stored). It must be
+// in that canonical form.
+func storageWord(val []byte) ([32]byte, bool) {
+	var w [32]byte
+	if len(val) == 0 {
+		return w, false
+	}
+	s, n, end, isList := readRLPItem(val, 0)
+	if isList || end != len(val) || n == 0 || n > 32 || val[s] == 0 {
+		return w, false
+	}
+	if n == 1 && s != 0 && val[s] < 0x80 {
+		return w, false // a byte below 0x80 is its own encoding
+	}
+	copy(w[32-n:], val[s:s+n])
+	return w, true
+}
+
+// keybytesToHex turns a key into nibbles with the terminator 16 appended
+// (go-ethereum trie/encoding.go).
+func keybytesToHex(str []byte) []byte {
+	l := len(str)*2 + 1
+	nibbles := make([]byte, l)
+	for i, b := range str {
+		nibbles[i*2] = b / 16
+		nibbles[i*2+1] = b % 16
+	}
+	nibbles[l-1] = 16
+	return nibbles
+}
+
+// compactToHex decodes a node's compact (hex-prefix) path into nibbles, with
+// the terminator when it is a leaf (go-ethereum trie/encoding.go).
+func compactToHex(compact []byte) []byte {
+	if len(compact) == 0 {
+		return compact
+	}
+	base := keybytesToHex(compact)
+	if base[0] < 2 { // extension: no terminator
+		base = base[:len(base)-1]
+	}
+	chop := 2 - base[0]&1 // odd length: the flag nibble carries the first nibble
+	return base[chop:]
+}
+
+func putUint64BE(b []byte, v uint64) {
+	for i := 7; i >= 0; i-- {
+		b[i] = byte(v)
+		v >>= 8
+	}
 }
 
 // stateOr reads a state key, or def when unset (the runtime reads a missing

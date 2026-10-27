@@ -38,7 +38,7 @@ func withNextCommittee(pv string, next string) string {
 // whose committee happens to be trusted.
 func TestRV4_ProofMustContinueTheStoredBeaconHead(t *testing.T) {
 	anchor := [32]byte{0xa1}
-	setupGapVerifier(t, 100, anchor)
+	setupVerifier(t, 100, anchor)
 	batch := testChain(101, 3, anchor, 0)
 	head := getBeaconHead()
 	skip := map[string]any{"proof": "ab", "public_values": testPublicValues(head+32, head+64, batch[2]), "headers": headersJSON(batch)}
@@ -54,7 +54,7 @@ func TestRV4_ProofMustContinueTheStoredBeaconHead(t *testing.T) {
 // is a no-op and "no next committee" is never stored.
 func TestRV4_TrustedCommitteeIsNeverOverwritten(t *testing.T) {
 	anchor := [32]byte{0xa1}
-	setupGapVerifier(t, 100, anchor)
+	setupVerifier(t, 100, anchor)
 	sdk.StateSetObject(SyncCommitteePrefix+"2", strings.Repeat("33", 32))
 	batch := testChain(101, 3, anchor, 0)
 	p := proveTip(batch)
@@ -67,7 +67,7 @@ func TestRV4_TrustedCommitteeIsNeverOverwritten(t *testing.T) {
 	}
 	// The stub does not roll state back on an abort (the runtime does), so the
 	// accepted case starts from a fresh verifier.
-	setupGapVerifier(t, 100, anchor)
+	setupVerifier(t, 100, anchor)
 	sdk.StateSetObject(SyncCommitteePrefix+"2", strings.Repeat("33", 32))
 	p = proveTip(batch)
 	p["public_values"] = withNextCommittee(p["public_values"].(string), strings.Repeat("33", 32))
@@ -98,14 +98,14 @@ func TestA2_OwnerPostingKeyCannotPinTheElfHash(t *testing.T) {
 	}
 }
 
-// B13: init refuses a retention under a day and defaults to a week.
+// B13 / RP-6: init refuses a retention under a day and defaults to 90 days.
 func TestB13_RetentionFloorAndDefault(t *testing.T) {
 	anchor := "0x" + strings.Repeat("a1", 32)
 	for _, tc := range []struct {
 		retention uint64
 		refused   bool
 		stored    string
-	}{{MinMaxRetention - 1, true, ""}, {MinMaxRetention, false, "7200"}, {0, false, "50400"}} {
+	}{{MinMaxRetention - 1, true, ""}, {MinMaxRetention, false, "7200"}, {0, false, "648000"}} {
 		freshVerifier(t)
 		msg := call(initContract, initParams(anchor, tc.retention))
 		if tc.refused {

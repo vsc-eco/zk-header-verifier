@@ -9,8 +9,11 @@ WASM contract for Magi that verifies SP1 Groth16 proofs of Ethereum consensus an
 3. The contract verifies the proof via the `crypto.sp1_verify_groth16` host function
 4. The contract verifies the hash chain: `keccak256(RLP(header))` must match the ZK-proven block hash
 5. Verified headers are stored in the same format as the EVM mapping contract's blocklist
-6. A proof's batch holds at most 12 headers but finalized checkpoints are ~32 blocks apart, so a batch that does not reach the stored chain opens a gap: its headers are stored and `submitHeaders` backfills the blocks below them, newest first, until the backfill meets the stored chain. No new proof is accepted while a gap is open
-7. The EVM bridge reads verified headers via `contracts.read(verifierContractId, key)`
+6. A proof stores only its own batch (the proven block, and any headers below it that hash into it); nothing has to be backfilled (RP-9). The header of any other block the bridge uses is stored on demand:
+   - `attestHistoryRoot` + `attestHeaders`: an EIP-2935 proof. The history contract `0x0000F90827F1C53a10cb7A02335B175320002935` holds the hashes of the 8,191 blocks before each block in its storage, so a stored block R's state root proves the header of any block R-8191 .. R-1 (account proof once per R, then a storage proof per header)
+   - `submitHeaders`: headers linked by parent hash down from a stored header, for blocks no stored root's window covers
+7. A stored header is kept `max_retention` blocks (of the proven tip) from when it was stored, then pruned; it can be stored again the same way (RP-6)
+8. The EVM bridge reads verified headers via `contracts.read(verifierContractId, key)`
 
 ## Actions
 
@@ -22,8 +25,10 @@ WASM contract for Magi that verifies SP1 Groth16 proofs of Ethereum consensus an
 | `cancelProposal` | Owner | Cancel a still-pending proposal before its `execHeight`. |
 | `expireProposal` | Anyone | Permissionless garbage-collect of a proposal whose `expireHeight` has passed. |
 | `setExpectedElfHash` | Owner | **First pin only** (deploy ramp-up, no trusted prior hash to rotate from). After the first call, this action is rejected — rotations go through `propose` + `execute`. |
-| `submitProof` | Anyone | Submit ZK proof + headers. Proof must be valid. Max 12 headers per tx. The proof must continue the stored beacon head from a trusted sync committee on the bound chain (`genesis_root`). A batch above the stored tip + 1 that does not link to it opens a gap; refused while a gap is open. |
-| `submitHeaders` | Anyone | Backfill an open gap: up to 12 headers, oldest first, the last one the parent of the lowest stored header. Closes the gap when the batch starts at the stored tip + 1 and links to it; refused (gap stays open) if it does not link. |
+| `submitProof` | Anyone | Submit ZK proof + headers (the proven block last; any headers before it must chain into it). Proof must be valid. Max 12 headers per tx. The proof must continue the stored beacon head from a trusted sync committee on the bound chain (`genesis_root`), and the proven block must be above the stored tip `h`, which it becomes. |
+| `attestHistoryRoot` | Anyone | `{block_number: R, account_proof}`: the EIP-2935 history contract's account proof (base64, concatenated MPT nodes) against stored block R's state root; its code hash must be the history contract's. Stores the contract's storage root as `hr-{R}`. |
+| `attestHeaders` | Anyone | `{root_block: R, headers: [{rlp_hex, storage_proof}]}`: for each header X with R-8191 <= X < R, the storage proof (base64) of slot X % 8191 against `hr-{R}` must hold keccak256(header). Stores each header. Never moves `h`. |
+| `submitHeaders` | Anyone | Up to 12 headers, oldest first, chained by parent hash; the last one must hash to the stored parent hash `ph-{last+1}` of the header above it. Stores them. Never moves `h`. |
 
 `updateVkey` is no longer a direct wasmexport — it is reachable only via `propose` (action `"updateVkey"`) and `execute` after the 400K-block timelock (F1 fix). The init path remains the one place a vkey is installed without timelock (no trusted prior state to rotate from).
 
@@ -31,11 +36,12 @@ WASM contract for Magi that verifies SP1 Groth16 proofs of Ethereum consensus an
 
 | Key | Value | Compatible with |
 |-----|-------|-----------------|
-| `h` | Last verified block height | evm-mapping-contract `GetLastHeight()` |
+| `h` | The newest proven block (the stored tip) | evm-mapping-contract `GetLastHeight()` |
 | `b-{N}` | 137-byte binary block header (v1, chainId label last) | evm-mapping-contract `GetHeader(N)` |
-| `lbh` | Hash of the newest stored header (`0x`-prefixed) | — |
-| `gapw` / `gapl` | Open gap: hash the next backfilled header must have / lowest backfilled height | — |
-| `gapb` / `gapa` | Open gap: stored tip height and hash the backfill must meet | — |
+| `ph-{N}` | Parent hash of stored header N (32 raw bytes) | — |
+| `hr-{N}` | EIP-2935 history contract storage root in the state of stored block N (32 raw bytes) | — |
+| `sl-{seq}` / `slh` / `slt` | Store log for pruning: `{height}:{tip when stored}`, oldest live seq, next seq | — |
+| `lbh` | Hash of the newest proven block (`0x`-prefixed), informational | — |
 | `vk` | Groth16 VK hex | — |
 | `vr` | VK root hex | — |
 | `sp1vk` | SP1 program vkey hash hex | — |
@@ -46,10 +52,11 @@ WASM contract for Magi that verifies SP1 Groth16 proofs of Ethereum consensus an
 - Hash chain verification: every header's `keccak256(RLP)` verified against proven block hash
 - Parent hash chain: each header's parentHash must equal `keccak256(RLP)` of the previous header
 - Sequential block numbers enforced
-- Max 12 headers per call; the node caps a call's payload at 8192 bytes, which fits ~5 Prague headers next to a proof and ~6 in a backfill
-- Backfilled headers hash into a proven block the same way; the gap closes only where the backfill links to the stored chain, and fails closed otherwise
-- Old headers pruned automatically (`max_retention`, default 50,400 blocks / 7 days, at least 7,200); backfill keeps the same window
-- Storage dominates the cost: ~2,640 RC per stored header (19 RC a written byte), so relaying every block takes ~19M RC a day
+- Max 12 headers per call; the node caps a call's payload at 8192 bytes, which fits ~5 Prague headers next to a proof, ~6 in `submitHeaders`, 2 in `attestHeaders`
+- Every stored header is bound to a proven block: by the keccak chain into it, by an EIP-2935 storage proof against a stored state root (MPT verification as go-ethereum's `trie.VerifyProof`), or by parent hash down from a stored header
+- EIP-2935 proofs must be fetched while the RPC still serves the state of R (geth keeps 128 blocks; a proven R is already ~64 behind the head): fetch at each newly finalized block. Without such an RPC, `submitHeaders` needs no state
+- Headers pruned `max_retention` blocks after they were stored (default 648,000 blocks / 90 days, at least 7,200), at most 2 per store
+- Storage dominates the cost (19 RC a written byte). Measured on the node's wasm runtime (real mainnet/Sepolia proofs): `attestHistoryRoot` ~810 RC, `attestHeaders` ~3,720 RC a header, `submitHeaders` ~3,420 RC a header. Only blocks the bridge uses are stored (was every block, ~19M RC a day)
 
 ## Prerequisites
 
