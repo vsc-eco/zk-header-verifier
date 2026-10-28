@@ -335,6 +335,15 @@ func TestRP9_SyntheticTries(t *testing.T) {
 	if msg := call(attestHistoryRoot, map[string]any{"block_number": 8000, "account_proof": b64(leaf)}); !strings.Contains(msg, "not the EIP-2935 history contract") {
 		t.Errorf("another contract's code = %q", msg)
 	}
+	// The right code but a storage root that is not 32 bytes: refused, nothing stored.
+	sr, leaf = oneLeafTrie(addr, rlpList(rlpUint(1), rlpUint(0), rlpBytes(storageRoot[:31]), rlpBytes(code)))
+	setup(sr)
+	if msg := call(attestHistoryRoot, map[string]any{"block_number": 8000, "account_proof": b64(leaf)}); !strings.Contains(msg, "the account is not [nonce, balance, storageRoot, codeHash]") {
+		t.Errorf("a 31-byte storage root = %q", msg)
+	}
+	if msg := attestHead(b64(storageLeaf)); !strings.Contains(msg, "no history root") {
+		t.Errorf("after a refused account: %q, want no history root stored", msg)
+	}
 	// Another account's proof (the key differs): absent.
 	sr, leaf = oneLeafTrie([]byte("not the history contract!!"), rlpList(rlpUint(1), rlpUint(0), rlpBytes(storageRoot[:]), rlpBytes(code)))
 	setup(sr)
