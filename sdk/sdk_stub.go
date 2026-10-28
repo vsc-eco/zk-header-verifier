@@ -15,7 +15,7 @@ import (
 )
 
 //go:wasmimport sdk console.log
-func log(s *string) *string { return nil }
+func log(s *string) *string { testLogs = append(testLogs, *s); return nil }
 
 func Log(s string) {
 	log(&s)
@@ -159,6 +159,7 @@ var (
 	testEnvJSON     = `{"contract.id":"contract:test","msg.caller":"hive:owner","msg.sender":"hive:owner","msg.required_auths":["hive:owner"]}`
 	testSp1Verdict  = false
 	testHaltOnAbort = false
+	testLogs        []string
 )
 
 // ResetTestState clears the store and env and makes every proof fail to verify.
@@ -168,7 +169,11 @@ func ResetTestState() {
 	testEnvJSON = `{"contract.id":"contract:test","msg.caller":"hive:owner","msg.sender":"hive:owner","msg.required_auths":["hive:owner"]}`
 	testSp1Verdict = false
 	testHaltOnAbort = false
+	testLogs = nil
 }
+
+// TestLogs returns the lines the contract logged since the last reset.
+func TestLogs() []string { return testLogs }
 
 // SetTestCaller makes addr the caller and sender (active authority).
 func SetTestCaller(addr string) {
