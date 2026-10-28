@@ -615,9 +615,10 @@ func submitProof(input *string) *string {
 	// period unless it is the prover's "no next committee" sentinel.
 	curPeriod := syncPeriod(pf.newHead)
 	// RV-4 (RV re-verify): write committees SET-IF-EMPTY with a mismatch revert,
-	// mirroring upstream SP1Helios.sol. The SP1 program does not reset
-	// store.next_sync_committee between proofs (missing upstream #54), so a
-	// prover could commit an UNVERIFIED next committee. Pre-fix this verifier
+	// mirroring upstream SP1Helios.sol. The SP1 program used to keep a
+	// prover-supplied store.next_sync_committee (upstream #54, fixed in the
+	// program since the port onto v1.3.0; this rule stays as the contract-side
+	// guard), so a prover could commit an UNVERIFIED next committee. Pre-fix this verifier
 	// stored sc-{curPeriod+1} unconditionally, so that bogus committee became
 	// trusted and a second proof could start from it and forge finality. Only
 	// writing an empty slot — and reverting if a proof ever disagrees with a
@@ -1558,6 +1559,28 @@ func storeProposal(pp *PendingProposal) {
 	sdk.StateSetObject(proposalKey(pp.ProposalId), string(b))
 }
 
+// emitProposal logs a proposal's new status under the "admin_proposal" prefix
+// and field names account-mapping's admin/proposals.go uses, so a watcher of
+// either contract sees a vkey or ELF-hash rotation while its timelock runs (the
+// timelock only helps if someone notices; upstream sp1-helios emits events on
+// vkey updates for the same reason).
+func emitProposal(pp *PendingProposal) {
+	hashHex := pp.PayloadHash
+	if len(hashHex) < 2 || hashHex[:2] != "0x" {
+		hashHex = "0x" + hashHex
+	}
+	b, _ := json.Marshal(map[string]string{
+		"action":      pp.Action,
+		"actor":       sdk.GetEnv().Caller.String(),
+		"proposalId":  strconv.FormatUint(pp.ProposalId, 10),
+		"payloadHash": hashHex,
+		"queueHeight": strconv.FormatUint(pp.QueueHeight, 10),
+		"execHeight":  strconv.FormatUint(pp.ExecHeight, 10),
+		"status":      strconv.FormatUint(uint64(pp.Status), 10),
+	})
+	sdk.Log("admin_proposal " + string(b))
+}
+
 // propose — owner queues a fund-affecting action. Returns {proposal_id, exec_height}.
 //
 //go:wasmexport propose
@@ -1596,6 +1619,7 @@ func propose(input *string) *string {
 		Status:       StatusPending,
 	}
 	storeProposal(pp)
+	emitProposal(pp)
 	out := `{"proposal_id":` + strconv.FormatUint(id, 10) + `,"exec_height":` + strconv.FormatUint(execH, 10) + `}`
 	return &out
 }
@@ -1640,6 +1664,7 @@ func execute(input *string) *string {
 	}
 	pp.Status = StatusAccepted
 	storeProposal(pp)
+	emitProposal(pp)
 	return nil
 }
 
@@ -1663,6 +1688,7 @@ func cancelProposal(input *string) *string {
 	}
 	pp.Status = StatusCancelled
 	storeProposal(pp)
+	emitProposal(pp)
 	return nil
 }
 
@@ -1689,6 +1715,7 @@ func expireProposal(input *string) *string {
 	}
 	pp.Status = StatusExpired
 	storeProposal(pp)
+	emitProposal(pp)
 	return nil
 }
 
