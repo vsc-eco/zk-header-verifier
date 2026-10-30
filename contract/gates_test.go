@@ -10,12 +10,14 @@ import (
 // Pre-merge review (2026-10-22): the RV-4, A2 and B13 gates had no test (a
 // mutation deleting each left the suite green).
 
-// initParams is a valid initContract payload anchored at block 100.
+// initParams is a valid initContract payload anchored at block 100: a test
+// deployment (A05: a public chain's label takes only its canonical root),
+// bound to the genesis root the proof fixtures commit.
 func initParams(anchor string, retention uint64) map[string]any {
 	return map[string]any{
 		"groth16_vk": "aa", "vk_root": "bb", "sp1_vkey_hash": "cc",
 		"max_retention": retention, "initial_height": 100, "initial_block_hash": anchor,
-		"expected_chain_id": 11155111, "genesis_root": strings.Repeat("11", 32),
+		"expected_chain_id": 31337, "is_testnet": true, "genesis_root": strings.Repeat("11", 32),
 		"initial_sync_committee_hash": strings.Repeat("22", 32), "initial_head": 8192,
 	}
 }
@@ -119,6 +121,36 @@ func TestB13_RetentionFloorAndDefault(t *testing.T) {
 		}
 		if got := sdk.StateGetObject(KeyMaxRetention); got == nil || *got != tc.stored {
 			t.Fatalf("max_retention %d stored as %v, want %s", tc.retention, got, tc.stored)
+		}
+	}
+}
+
+// A05: the chain-id label and the genesis root are bound: a known chain takes
+// only its own root (chain 1 with Sepolia's was accepted), another chain only
+// as a test deployment, and chain 1 never as one.
+func TestA05_ChainLabelNeedsItsGenesisRoot(t *testing.T) {
+	anchor := "0x" + strings.Repeat("ab", 32)
+	for _, tc := range []struct {
+		name    string
+		chain   uint64
+		root    string
+		testnet bool
+		ok      bool
+	}{
+		{"mainnet label, Sepolia root", 1, canonicalGenesisRoot[11155111], false, false},
+		{"mainnet label, mainnet root", 1, canonicalGenesisRoot[1], false, true},
+		{"mainnet root with 0x and capitals", 1, "0x" + strings.ToUpper(canonicalGenesisRoot[1]), false, true},
+		{"Sepolia label, mainnet root", 11155111, canonicalGenesisRoot[1], false, false},
+		{"Sepolia label, Sepolia root", 11155111, canonicalGenesisRoot[11155111], true, true},
+		{"unknown chain, not a test deployment", 31337, strings.Repeat("11", 32), false, false},
+		{"unknown chain, test deployment", 31337, strings.Repeat("11", 32), true, true},
+		{"mainnet as a test deployment", 1, canonicalGenesisRoot[1], true, false},
+	} {
+		freshVerifier(t)
+		p := initParams(anchor, 0)
+		p["expected_chain_id"], p["genesis_root"], p["is_testnet"] = tc.chain, tc.root, tc.testnet
+		if msg := call(initContract, p); (msg == "") != tc.ok {
+			t.Errorf("%s: %q, want ok=%v", tc.name, msg, tc.ok)
 		}
 	}
 }
