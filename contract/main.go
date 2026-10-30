@@ -188,6 +188,13 @@ type InitContractParams struct {
 	InitialHead              uint64 `json:"initial_head"`
 }
 
+// canonicalGenesisRoot is each public chain's beacon genesis_validators_root
+// (lowercase hex, no 0x), the form normalizeHash32 returns.
+var canonicalGenesisRoot = map[uint64]string{
+	1:        "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95", // Ethereum mainnet
+	11155111: "d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078", // Sepolia
+}
+
 //go:wasmexport init
 func initContract(input *string) *string {
 	checkOwner()
@@ -239,6 +246,21 @@ func initContract(input *string) *string {
 	}
 	genesisRoot := normalizeHash32(params.GenesisRoot, "genesis_root")
 	initialCommittee := normalizeHash32(params.InitialSyncCommitteeHash, "initial_sync_committee_hash")
+	// A05: the chain-id label and the genesis root were taken independently,
+	// so a verifier labelled chain 1 could be bound to Sepolia's beacon chain
+	// (proven: init accepted it) and stamp Sepolia headers as mainnet ones.
+	// A known chain's label now requires its own root; any other chain is a
+	// test deployment and must say so, and chain 1 never can.
+	if want, known := canonicalGenesisRoot[params.ExpectedChainId]; known {
+		if genesisRoot != want {
+			ce.Abort(ce.ErrInput, "genesis_root is not chain "+strconv.FormatUint(params.ExpectedChainId, 10)+"'s genesis_validators_root", "init")
+		}
+	} else if !params.IsTestnet {
+		ce.Abort(ce.ErrInput, "expected_chain_id "+strconv.FormatUint(params.ExpectedChainId, 10)+" has no canonical genesis root here: only a test deployment (is_testnet) may use it", "init")
+	}
+	if params.ExpectedChainId == 1 && params.IsTestnet {
+		ce.Abort(ce.ErrInput, "is_testnet on chain 1 (Ethereum mainnet)", "init")
+	}
 
 	sdk.StateSetObject(KeyGroth16Vk, params.Groth16Vk)
 	sdk.StateSetObject(KeyVkRoot, params.VkRoot)
