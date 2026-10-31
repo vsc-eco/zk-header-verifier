@@ -5,7 +5,17 @@ TARGET = contract/main.go
 WASM = $(BIN_DIR)/main.wasm
 BUILD_FLAGS = -gc=custom -scheduler=none -panic=trap -no-debug -target=wasm-unknown
 
-TINYGO_IMAGE := tinygo/tinygo:0.41.1
+# A2/F8 (MED #36): supply-chain pinning. A bare `:0.41.1` tag is MUTABLE — the
+# upstream image owner (or a registry compromise) can re-push it, so a "clean"
+# rebuild can silently produce a DIFFERENT WASM and a CID mismatch. The build is
+# pinned to the IMMUTABLE content digest of the exact image (an `@sha256:...`
+# reference cannot be re-pointed). The tag is kept only as a human-readable
+# comment. The digest below is the OCI image-index digest of tinygo/tinygo:0.41.1
+# and is the load-bearing reference; verify/refresh it with:
+#     docker buildx imagetools inspect tinygo/tinygo:0.41.1 --format '{{.Manifest.Digest}}'
+TINYGO_TAG    := tinygo/tinygo:0.41.1
+TINYGO_DIGEST := sha256:b216f534ddbf277444407b014a3328b5c1ade403cc397f3ab48a14789bf99d0e
+TINYGO_IMAGE  := tinygo/tinygo@$(TINYGO_DIGEST)
 WORKDIR      := /work
 
 # For each local path in go.work (use/replace directives), add a Docker volume
