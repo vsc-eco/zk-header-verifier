@@ -1,6 +1,6 @@
 module zk-header-verifier
 
-go 1.24.13
+go 1.25.0
 
 require github.com/CosmWasm/tinyjson v0.9.0
 
